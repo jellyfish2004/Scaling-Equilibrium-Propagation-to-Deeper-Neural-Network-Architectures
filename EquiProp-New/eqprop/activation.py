@@ -8,6 +8,9 @@ def hard_sigmoid(x):
 def identity(x):
     return x
 
+def relu6(x):
+    return torch.clamp(x, 0., 6.)
+
 class LearnableClampedReLU(nn.Module):
     def __init__(self, init_threshold=6.0):
         super().__init__()

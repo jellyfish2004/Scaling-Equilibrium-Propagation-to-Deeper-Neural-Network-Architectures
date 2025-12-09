@@ -57,8 +57,7 @@ class InteractionConv2d(Interaction):
 
     def create_state(self, batch_size, device):
         # allocate in channels_last directly
-        state = torch.zeros(batch_size, self.conv.out_channels, self.h_out, self.w_out,
-                            device=device, requires_grad=False).contiguous(memory_format=torch.channels_last)
+        state = torch.zeros(batch_size, self.conv.out_channels, self.h_out, self.w_out, device=device, requires_grad=False).contiguous(memory_format=torch.channels_last)
         return state
 
     def energy(self, pre, post):

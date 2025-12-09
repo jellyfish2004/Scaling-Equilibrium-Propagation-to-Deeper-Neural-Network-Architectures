@@ -5,7 +5,7 @@ import numpy as np
 import inspect
 from tqdm import tqdm
 from eqprop.functional import compute_betas
-from eqprop.activation import hard_sigmoid, identity
+from eqprop.activation import hard_sigmoid, identity, relu6
 from .layers import InteractionConv2d, InteractionConvMaxPool2d, InteractionLinear
 
 class InteractionBaseHopfieldModel(nn.Module):
@@ -100,7 +100,7 @@ class InteractionBaseHopfieldModel(nn.Module):
 
 
 class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
-    def __init__(self):
+    def __init__(self, activation=hard_sigmoid):
         weight_gains = [0.4, 0.7, 0.6, 0.3, 0.4]
         bias_gains = [
             0.5 / ((3   * 3 * 3) ** 0.5),
@@ -131,7 +131,7 @@ class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
             (10,)
         ]
 
-        activations = [hard_sigmoid] * 4 + [identity] 
+        activations = [activation] * 4 + [identity]
 
         connections = [
             (interactions[0], (0, 1)),
@@ -146,7 +146,7 @@ class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
 
 
 class ResNet13_Interactions(InteractionBaseHopfieldModel):
-    def __init__(self, num_inputs=3, num_outputs=10):
+    def __init__(self, num_inputs=3, num_outputs=10, activation=hard_sigmoid):
         nn.Module.__init__(self)
 
         weight_gains = [
@@ -157,7 +157,7 @@ class ResNet13_Interactions(InteractionBaseHopfieldModel):
             0.8
         ]
         bias_gains = [0.5 / np.sqrt(ni * 3 * 3) for ni in
-                     [num_inputs, 128, num_inputs, 128, 256, 128, 256, 512, 256, 512, 512, 512, 512]]
+                     [num_inputs, 128, 128, 256, 256, 512, 512, 512, 512]]
 
         interactions = [
             InteractionConv2d(3, 128, 3, h_out=32, w_out=32, stride=1, padding=1,
@@ -165,27 +165,34 @@ class ResNet13_Interactions(InteractionBaseHopfieldModel):
             InteractionConv2d(128, 128, 3, h_out=16, w_out=16, stride=2, padding=1,
                               weight_gain=weight_gains[0], bias_gain=bias_gains[1]),
             InteractionConv2d(3, 128, 1, h_out=16, w_out=16, stride=2, padding=0,
-                              weight_gain=weight_gains[0], bias_gain=bias_gains[2]),
+                              weight_gain=weight_gains[0], bias=False),
+            
+            # Block 2
             InteractionConv2d(128, 256, 3, h_out=16, w_out=16, stride=1, padding=1,
-                              weight_gain=weight_gains[1], bias_gain=bias_gains[3]),
-            InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
-                              weight_gain=weight_gains[1], bias_gain=bias_gains[4]),
+                              weight_gain=weight_gains[1], bias_gain=bias_gains[2]),
             InteractionConv2d(128, 256, 1, h_out=8, w_out=8, stride=2, padding=0,
-                              weight_gain=weight_gains[1], bias_gain=bias_gains[5]),
+                              weight_gain=weight_gains[1], bias=False), # Skip (2,4) moved up
+            InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
+                              weight_gain=weight_gains[1], bias_gain=bias_gains[3]),
+            
+            # Block 3
             InteractionConv2d(256, 512, 3, h_out=8, w_out=8, stride=1, padding=1,
-                              weight_gain=weight_gains[2], bias_gain=bias_gains[6]),
-            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
-                              weight_gain=weight_gains[2], bias_gain=bias_gains[7]),
+                              weight_gain=weight_gains[2], bias_gain=bias_gains[4]),
             InteractionConv2d(256, 512, 1, h_out=4, w_out=4, stride=2, padding=0,
-                              weight_gain=weight_gains[2], bias_gain=bias_gains[8]),
+                              weight_gain=weight_gains[2], bias=False), # Skip (4,6) moved up
+            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
+                              weight_gain=weight_gains[2], bias_gain=bias_gains[5]),
+            
+            # Block 4
             InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=1, padding=1,
-                              weight_gain=weight_gains[3], bias_gain=bias_gains[9]),
-            InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
-                              weight_gain=weight_gains[3], bias_gain=bias_gains[10]),
+                              weight_gain=weight_gains[3], bias_gain=bias_gains[6]),
             InteractionConv2d(512, 512, 1, h_out=2, w_out=2, stride=2, padding=0,
-                              weight_gain=weight_gains[3], bias_gain=bias_gains[11]),
+                              weight_gain=weight_gains[3], bias=False), # Skip (6,8) moved up
+            InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
+                              weight_gain=weight_gains[3], bias_gain=bias_gains[7]),
+            
             InteractionLinear(512*2*2, num_outputs,
-                              weight_gain=weight_gains[4], bias_gain=bias_gains[12])
+                              weight_gain=weight_gains[4], bias_gain=bias_gains[8])
         ]
 
         state_shapes = [
@@ -200,21 +207,25 @@ class ResNet13_Interactions(InteractionBaseHopfieldModel):
             (num_outputs,)
         ]
 
-        activations = [hard_sigmoid] * 8 + [identity]
+        activations = [activation] * 8 + [identity]
 
         connections = [
             (interactions[0], (0, 1)),
             (interactions[1], (1, 2)),
             (interactions[2], (0, 2)),
+            
             (interactions[3], (2, 3)),
-            (interactions[4], (3, 4)),
-            (interactions[5], (2, 4)),
+            (interactions[4], (2, 4)), # Skip (2,4)
+            (interactions[5], (3, 4)),
+            
             (interactions[6], (4, 5)),
-            (interactions[7], (5, 6)),
-            (interactions[8], (4, 6)),
+            (interactions[7], (4, 6)), # Skip (4,6)
+            (interactions[8], (5, 6)),
+            
             (interactions[9], (6, 7)),
-            (interactions[10], (7, 8)),
-            (interactions[11], (6, 8)),
+            (interactions[10], (6, 8)), # Skip (6,8)
+            (interactions[11], (7, 8)),
+            
             (interactions[12], (8, 9))
         ]
 
@@ -234,23 +245,19 @@ class ResNet16_Interactions(InteractionBaseHopfieldModel):
             0.6, 0.7, 0.6,
             0.8
         ]
+        # Only 11 bias gains: 2 per block (no skip bias) + 1 for linear
         bias_gains = [
-            0.5 / np.sqrt(num_inputs * 3 * 3),
-            0.5 / np.sqrt(128 * 3 * 3),
-            0.5 / np.sqrt(num_inputs * 1 * 1),
-            0.5 / np.sqrt(128 * 3 * 3),
-            0.5 / np.sqrt(256 * 3 * 3),
-            0.5 / np.sqrt(128 * 1 * 1),
-            0.5 / np.sqrt(256 * 3 * 3),
-            0.5 / np.sqrt(512 * 3 * 3),
-            0.5 / np.sqrt(256 * 1 * 1),
-            0.5 / np.sqrt(512 * 3 * 3),
-            0.5 / np.sqrt(512 * 3 * 3),
-            0.5 / np.sqrt(512 * 1 * 1),
-            0.5 / np.sqrt(512 * 3 * 3),
-            0.5 / np.sqrt(1024 * 3 * 3),
-            0.5 / np.sqrt(512 * 1 * 1),
-            0.5 / np.sqrt(1024 * 2 * 2),
+            0.5 / np.sqrt(num_inputs * 3 * 3),  # Block 1 conv1
+            0.5 / np.sqrt(128 * 3 * 3),         # Block 1 conv2
+            0.5 / np.sqrt(128 * 3 * 3),         # Block 2 conv1
+            0.5 / np.sqrt(256 * 3 * 3),         # Block 2 conv2
+            0.5 / np.sqrt(256 * 3 * 3),         # Block 3 conv1
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 3 conv2
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 4 conv1
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 4 conv2
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 5 conv1
+            0.5 / np.sqrt(1024 * 3 * 3),        # Block 5 conv2
+            0.5 / np.sqrt(1024 * 2 * 2),        # Linear
         ]
 
         interactions = [
@@ -258,40 +265,40 @@ class ResNet16_Interactions(InteractionBaseHopfieldModel):
             InteractionConv2d(3, 128, 3, h_out=32, w_out=32, stride=1, padding=1,
                          weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
             InteractionConv2d(128, 128, 3, h_out=16, w_out=16, stride=2, padding=1,
-                         weight_gain=weight_gains[0], bias_gain=bias_gains[1]),
+                         weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
             InteractionConv2d(3, 128, 1, h_out=16, w_out=16, stride=2, padding=0,
-                         weight_gain=weight_gains[0], bias_gain=bias_gains[2]),
+                         weight_gain=weight_gains[2], bias=False),  # Skip - no bias
             # Block 2
             InteractionConv2d(128, 256, 3, h_out=16, w_out=16, stride=1, padding=1,
-                         weight_gain=weight_gains[1], bias_gain=bias_gains[3]),
+                         weight_gain=weight_gains[3], bias_gain=bias_gains[2]),
             InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
-                         weight_gain=weight_gains[1], bias_gain=bias_gains[4]),
+                         weight_gain=weight_gains[4], bias_gain=bias_gains[3]),
             InteractionConv2d(128, 256, 1, h_out=8, w_out=8, stride=2, padding=0,
-                         weight_gain=weight_gains[1], bias_gain=bias_gains[5]),
+                         weight_gain=weight_gains[5], bias=False),  # Skip - no bias
             # Block 3
             InteractionConv2d(256, 512, 3, h_out=8, w_out=8, stride=1, padding=1,
-                         weight_gain=weight_gains[2], bias_gain=bias_gains[6]),
+                         weight_gain=weight_gains[6], bias_gain=bias_gains[4]),
             InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
-                         weight_gain=weight_gains[2], bias_gain=bias_gains[7]),
+                         weight_gain=weight_gains[7], bias_gain=bias_gains[5]),
             InteractionConv2d(256, 512, 1, h_out=4, w_out=4, stride=2, padding=0,
-                         weight_gain=weight_gains[2], bias_gain=bias_gains[8]),
+                         weight_gain=weight_gains[8], bias=False),  # Skip - no bias
             # Block 4
             InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=1, padding=1,
-                         weight_gain=weight_gains[3], bias_gain=bias_gains[9]),
+                         weight_gain=weight_gains[9], bias_gain=bias_gains[6]),
             InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
-                         weight_gain=weight_gains[3], bias_gain=bias_gains[10]),
+                         weight_gain=weight_gains[10], bias_gain=bias_gains[7]),
             InteractionConv2d(512, 512, 1, h_out=2, w_out=2, stride=2, padding=0,
-                         weight_gain=weight_gains[3], bias_gain=bias_gains[11]),
+                         weight_gain=weight_gains[11], bias=False),  # Skip - no bias
             # Block 5
             InteractionConv2d(512, 1024, 3, h_out=2, w_out=2, stride=1, padding=1,
-                         weight_gain=weight_gains[4], bias_gain=bias_gains[12]),
+                         weight_gain=weight_gains[12], bias_gain=bias_gains[8]),
             InteractionConv2d(1024, 1024, 3, h_out=2, w_out=2, stride=1, padding=1,
-                         weight_gain=weight_gains[4], bias_gain=bias_gains[13]),
+                         weight_gain=weight_gains[13], bias_gain=bias_gains[9]),
             InteractionConv2d(512, 1024, 1, h_out=2, w_out=2, stride=1, padding=0,
-                         weight_gain=weight_gains[4], bias_gain=bias_gains[14]),
+                         weight_gain=weight_gains[14], bias=False),  # Skip - no bias
             # Final linear
             InteractionLinear(1024*2*2, num_outputs,
-                         weight_gain=weight_gains[5], bias_gain=bias_gains[15])
+                         weight_gain=weight_gains[15], bias_gain=bias_gains[10])
         ]
 
         state_shapes = [
@@ -341,7 +348,7 @@ class ResNet16_Interactions(InteractionBaseHopfieldModel):
 
 
 def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True,
-                         n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None):
+                         n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None):
     B = x.size(0)
     device = x.device
 
@@ -361,19 +368,26 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, streams=streams)
     nudged_states = [s.detach() for s in nudged_states]
 
-    E_1 = model.energy(x, nudged_states, b1, target=y)
+    E_1 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_1 = E_1.mean() if use_mean_reduction else E_1.sum()
     grads_1 = torch.autograd.grad(E_1, model.parameters(), create_graph=False)
 
     # Phase 2 (restart from free)
     nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, streams=streams)
     nudged_states = [s.detach() for s in nudged_states]
-    E_2 = model.energy(x, nudged_states, b2, target=y)
+    E_2 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_2 = E_2.mean() if use_mean_reduction else E_2.sum()
     grads_2 = torch.autograd.grad(E_2, model.parameters(), create_graph=False)
 
     # EP update
     grads = [((g2 - g1).detach() / denom) for g1, g2 in zip(grads_1, grads_2)]
+    
+    if grad_clip is not None:
+        total_norm = torch.norm(torch.stack([g.norm() for g in grads]))
+        if total_norm > grad_clip:
+            scale = grad_clip / (total_norm + 1e-6)
+            grads = [g * scale for g in grads]
+            
     optimizer.zero_grad()
     for p, g in zip(model.parameters(), grads):
         p.grad = g

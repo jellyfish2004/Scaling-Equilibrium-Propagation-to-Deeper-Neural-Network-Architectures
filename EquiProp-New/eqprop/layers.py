@@ -178,7 +178,7 @@ class ResBlock(EqPropLayer):
     
     Architecture:
     - Main path: Conv3x3 -> s^n -> Conv3x3 -> output
-    - Residual path: Conv1x1 -> output
+    - Residual path: Conv1x1 -> output (no bias)
     - Output: main_path + residual_path
     
     The block manages two internal states:
@@ -188,13 +188,13 @@ class ResBlock(EqPropLayer):
     def __init__(self, in_ch, out_ch, h_out, w_out, strides=[1,2,2], 
                  h_intermediate=None, w_intermediate=None, padding=1,
                  weight_gains=[None, None, None],
-                 bias_gains=[None, None, None],
+                 bias_gains=[None, None],  # Only 2 biases: conv1, conv2 (skip has no bias)
                  activation=None):
         super().__init__(activation=activation)
         
         stride_conv1, stride_conv2, stride_skip = strides
         weight_gain_conv1, weight_gain_conv2, weight_gain_skip = weight_gains
-        bias_gain_conv1, bias_gain_conv2, bias_gain_skip = bias_gains
+        bias_gain_conv1, bias_gain_conv2 = bias_gains  # Only 2 bias gains
         # Calculate intermediate dimensions if not provided
         if h_intermediate is None:
             # Assume stride_conv1=1 means same size, otherwise halve
@@ -219,10 +219,10 @@ class ResBlock(EqPropLayer):
                                    weight_gain=weight_gain_conv2, bias_gain=bias_gain_conv2,
                                    activation=activation_conv2)
         
-        # Residual path: 1x1 convolution for dimension matching
+        # Residual path: 1x1 convolution for dimension matching (NO BIAS)
         self.conv_skip = EqPropConv2d(in_ch, out_ch, 1, h_out, w_out,
                                        stride=stride_skip, padding=0,
-                                       weight_gain=weight_gain_skip, bias_gain=bias_gain_skip,
+                                       weight_gain=weight_gain_skip, bias=False,
                                        activation=activation_conv2)
         
         self.h_out = h_out

@@ -213,20 +213,16 @@ class ResNet13(BaseHopfieldModel):
                  ):
         super().__init__()
         
-        # Calculate bias gains based on reference pattern
+        # Calculate bias gains - only 2 per block (conv1, conv2), no bias for skip
         bias_gains = [
             0.5 / np.sqrt(num_inputs * 3 * 3),      # Block 1 conv1
             0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 1 conv2
-            0.5 / np.sqrt(num_inputs * 1 * 1),     # Block 1 skip
             0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 2 conv1
             0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 2 conv2
-            0.5 / np.sqrt(num_hiddens_1 * 1 * 1),  # Block 2 skip
             0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 3 conv1
             0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 3 conv2
-            0.5 / np.sqrt(num_hiddens_2 * 1 * 1),  # Block 3 skip
             0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 4 conv1
             0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 4 conv2
-            0.5 / np.sqrt(num_hiddens_3 * 1 * 1),  # Block 4 skip
             0.5 / np.sqrt(num_hiddens_4 * 2 * 2),  # Dense layer
         ]
         weight_gains = [
@@ -243,28 +239,28 @@ class ResNet13(BaseHopfieldModel):
                     strides=[1,2,2],
                     h_intermediate=32, w_intermediate=32,
                     weight_gains=weight_gains[0:3],
-                    bias_gains=bias_gains[0:3]),
+                    bias_gains=bias_gains[0:2]),  # Only 2 bias gains per block
             # Block 2: 128 -> 256, 16x16 -> 8x8
             ResBlock(num_hiddens_1, num_hiddens_2, h_out=8, w_out=8,
                     strides=[1,2,2],
                     h_intermediate=16, w_intermediate=16,
                     weight_gains=weight_gains[3:6],
-                    bias_gains=bias_gains[3:6]),
+                    bias_gains=bias_gains[2:4]),  # Only 2 bias gains per block
             # Block 3: 256 -> 512, 8x8 -> 4x4
             ResBlock(num_hiddens_2, num_hiddens_3, h_out=4, w_out=4,
                     strides=[1,2,2],
                     h_intermediate=8, w_intermediate=8,
                     weight_gains=weight_gains[6:9],
-                    bias_gains=bias_gains[6:9]),
+                    bias_gains=bias_gains[4:6]),  # Only 2 bias gains per block
             # Block 4: 512 -> 512, 4x4 -> 2x2
             ResBlock(num_hiddens_3, num_hiddens_4, h_out=2, w_out=2,
                     strides=[1,2,2],
                     h_intermediate=4, w_intermediate=4,
                     weight_gains=weight_gains[9:12],
-                    bias_gains=bias_gains[9:12]),
+                    bias_gains=bias_gains[6:8]),  # Only 2 bias gains per block
             # Dense layer: 512*2*2 -> num_outputs
             EqPropLinear(num_hiddens_4 * 2 * 2, num_outputs,
-                        weight_gain=weight_gains[12], bias_gain=bias_gains[12], activation=identity)
+                        weight_gain=weight_gains[12], bias_gain=bias_gains[8], activation=identity)
         ])
         self.output = self.layers[-1]
         self.cost_type = 'CE'
@@ -278,24 +274,19 @@ class ResNet16(BaseHopfieldModel):
                  ):
         super().__init__()
         
-        # Calculate bias gains based on reference pattern
+        # Calculate bias gains - only 2 per block (conv1, conv2), no bias for skip
         bias_gains = [
             0.5 / np.sqrt(num_inputs * 3 * 3),      # Block 1 conv1
             0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 1 conv2
-            0.5 / np.sqrt(num_inputs * 1 * 1),     # Block 1 skip
             0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 2 conv1
             0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 2 conv2
-            0.5 / np.sqrt(num_hiddens_1 * 1 * 1),  # Block 2 skip
             0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 3 conv1
             0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 3 conv2
-            0.5 / np.sqrt(num_hiddens_2 * 1 * 1),  # Block 3 skip
             0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 4 conv1
             0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 4 conv2
-            0.5 / np.sqrt(num_hiddens_3 * 1 * 1),  # Block 4 skip
-            0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 5 conv1
-            0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 5 conv2
-            0.5 / np.sqrt(num_hiddens_3 * 1 * 1),  # Block 5 skip
-            0.5 / np.sqrt(num_hiddens_4 * 2 * 2),  # Dense layer
+            0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 5 conv1
+            0.5 / np.sqrt(num_hiddens_5 * 3 * 3),  # Block 5 conv2
+            0.5 / np.sqrt(num_hiddens_5 * 2 * 2),  # Dense layer
         ]
 
         weight_gains = [
@@ -313,40 +304,40 @@ class ResNet16(BaseHopfieldModel):
                     strides=[1,2,2],
                     h_intermediate=32, w_intermediate=32,
                     weight_gains=weight_gains[0:3],
-                    bias_gains=bias_gains[0:3]),
+                    bias_gains=bias_gains[0:2]),  # Only 2 bias gains per block
             # Block 2: 128 -> 256, 16x16 -> 8x8
             ResBlock(num_hiddens_1, num_hiddens_2, h_out=8, w_out=8,
                     strides=[1,2,2],
                     h_intermediate=16, w_intermediate=16,
                     weight_gains=weight_gains[3:6],
-                    bias_gains=bias_gains[3:6]),
+                    bias_gains=bias_gains[2:4]),  # Only 2 bias gains per block
             # Block 3: 256 -> 512, 8x8 -> 4x4
             ResBlock(num_hiddens_2, num_hiddens_3, h_out=4, w_out=4,
                     strides=[1,2,2],
                     h_intermediate=8, w_intermediate=8,
                     weight_gains=weight_gains[6:9],
-                    bias_gains=bias_gains[6:9]),
+                    bias_gains=bias_gains[4:6]),  # Only 2 bias gains per block
             # Block 4: 512 -> 512, 4x4 -> 2x2
             ResBlock(num_hiddens_3, num_hiddens_4, h_out=2, w_out=2,
                     strides=[1,2,2],
                     h_intermediate=4, w_intermediate=4,
                     weight_gains=weight_gains[9:12],
-                    bias_gains=bias_gains[9:12]),
-            # Block 5: 512 -> 512, 2x2 -> 1x1
+                    bias_gains=bias_gains[6:8]),  # Only 2 bias gains per block
+            # Block 5: 512 -> 1024, 2x2 -> 2x2
             ResBlock(num_hiddens_4, num_hiddens_5, h_out=2, w_out=2,
                     strides=[1,1,1],
                     h_intermediate=2, w_intermediate=2,
                     weight_gains=weight_gains[12:15],
-                    bias_gains=bias_gains[12:15]),
-            # Dense layer: 512*1*1 -> num_outputs
+                    bias_gains=bias_gains[8:10]),  # Only 2 bias gains per block
+            # Dense layer: 1024*2*2 -> num_outputs
             EqPropLinear(num_hiddens_5 * 2 * 2, num_outputs,
-                        weight_gain=weight_gains[15], bias_gain=bias_gains[15], activation=identity)
+                        weight_gain=weight_gains[15], bias_gain=bias_gains[10], activation=identity)
         ])
         self.output = self.layers[-1]
         self.cost_type = 'CE'
 
 
-def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True, n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None):
+def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True, n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None):
     B = x.size(0)
     device = x.device
     
@@ -369,7 +360,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     # Phase 1
     nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, streams=streams)
     nudged_states = [[s.detach() for s in state_list] for state_list in nudged_states]
-    E_1 = model.energy(x, nudged_states, b1, target=y)
+    E_1 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_1 = E_1.mean() if use_mean_reduction else E_1.sum()
     with torch.cuda.nvtx.range("Weight Grads 1"):
         grads_1 = torch.autograd.grad(E_1, model.parameters(), create_graph=False)
@@ -377,13 +368,19 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     # Phase 2 (restart from free)
     nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, streams=streams)
     nudged_states = [[s.detach() for s in state_list] for state_list in nudged_states]
-    E_2 = model.energy(x, nudged_states, b2, target=y)
+    E_2 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_2 = E_2.mean() if use_mean_reduction else E_2.sum()
     with torch.cuda.nvtx.range("Weight Grads 2"):
         grads_2 = torch.autograd.grad(E_2, model.parameters(), create_graph=False)
+
     # EP update
     with torch.cuda.nvtx.range("Optimizer Step"):
         grads = [((g2 - g1).detach() / denom) for g1, g2 in zip(grads_1, grads_2)]
+        if grad_clip is not None:
+            total_norm = torch.norm(torch.stack([g.norm() for g in grads]))
+            if total_norm > grad_clip:
+                scale = grad_clip / (total_norm + 1e-6)
+                grads = [g * scale for g in grads]
         optimizer.zero_grad()
         for p, g in zip(model.parameters(), grads):
             p.grad = g

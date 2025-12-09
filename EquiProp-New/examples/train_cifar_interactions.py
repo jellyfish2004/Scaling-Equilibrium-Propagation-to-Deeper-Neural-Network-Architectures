@@ -114,7 +114,8 @@ def _train_loop():
                 beta=args.beta, use_mean_reduction=True,
                 n_iters_free=args.iters_infer, n_iters_nudged=args.iters_train,
                 streams=streams,
-                previous_states=previous_states
+                previous_states=previous_states,
+                grad_clip=1.0
             )
             if step==0:
                 print(f"first batch (torch compile): {time.time() - start_time}")
