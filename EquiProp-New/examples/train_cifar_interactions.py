@@ -15,6 +15,7 @@ from eqprop.interactions.core import (
     ResNet13_Interactions, 
     ResNet16_Interactions
 )
+from eqprop.activation import relu6, hard_sigmoid
 from dataset import _build_cifar10_loaders
 
 torch.set_float32_matmul_precision('high')
@@ -148,6 +149,7 @@ def _train_loop():
     parser.add_argument('--lr', type=float, default=3e-2, help="Learning rate")
     parser.add_argument('--momentum', type=float, default=0.9, help="Momentum")
     parser.add_argument('--weight_decay', type=float, default=2.5e-4, help="Weight decay")
+    parser.add_argument('--activation', type=str, default='relu6', choices=['relu6', 'hard_sigmoid'], help="Activation function")
     args = parser.parse_args()
 
     device = args.device
@@ -162,12 +164,18 @@ def _train_loop():
     if args.model not in ['resnet_16', 'resnet_13', 'vgg5']:
         raise ValueError(f"Unsupported model '{args.model}'. Choose from ['resnet_16', 'resnet_13', 'vgg5'].")
     
+    # Select activation function
+    if args.activation == 'relu6':
+        act_fn = relu6
+    else:
+        act_fn = hard_sigmoid
+    
     if args.model == 'resnet_16':
-        model = ResNet16_Interactions()
+        model = ResNet16_Interactions(activation=act_fn)
     elif args.model == 'resnet_13':
-        model = ResNet13_Interactions()
+        model = ResNet13_Interactions(activation=act_fn)
     elif args.model == 'vgg5':
-        model = ConvHopfieldEnergy32_Interactions()
+        model = ConvHopfieldEnergy32_Interactions(activation=act_fn)
     
     model.cost_type = args.cost
     model.to(device)
@@ -232,8 +240,9 @@ def _train_loop():
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
-        running_E_1 = 0.0
-        running_E_2 = 0.0
+        running_E_free = 0.0  # Energy at free equilibrium
+        running_E_1 = 0.0     # Energy at positive nudged equilibrium
+        running_E_2 = 0.0     # Energy at negative nudged equilibrium
         running_correct = 0
         running_top5_correct = 0
         running_count = 0
@@ -252,7 +261,7 @@ def _train_loop():
         for step, (x, y) in enumerate(iterator):
             x = x.to(device, memory_format=torch.channels_last)
             y = y.to(device)
-            E_1, E_2, logits_free, batch_loss, previous_states = train_batch_centered(
+            E_free, E_1, E_2, logits_free, batch_loss, previous_states = train_batch_centered(
                 model, x, y, optimizer,
                 beta=args.beta, use_mean_reduction=True,
                 n_iters_free=args.iters_infer, n_iters_nudged=args.iters_train,
@@ -274,6 +283,7 @@ def _train_loop():
             running_correct += correct
             running_count += batch_size
             running_loss += batch_loss
+            running_E_free += float(E_free)
             running_E_1 += float(E_1)
             running_E_2 += float(E_2)
             
@@ -294,8 +304,8 @@ def _train_loop():
             
             if use_tqdm and (step % 1 == 0):
                 iterator.set_postfix({
-                    'E_1': f"{E_1:.4f}",
-                    'E_nudged': f"{E_2:.4f}",
+                    'E_free': f"{E_free:.4f}",
+                    'E_nudged': f"{E_1:.4f}",
                     'acc': f"{(correct / max(1, batch_size)) * 100:.2f}%",
                     'loss': f"{batch_loss:.4f}",
                 })
@@ -310,19 +320,21 @@ def _train_loop():
         
         denom = max(1, len(train_loader))
         avg_loss = running_loss / denom
+        avg_E_free = running_E_free / denom
         avg_E_1 = running_E_1 / denom
         avg_E_2 = running_E_2 / denom
         train_acc = running_correct / max(1, running_count)
         train_top5_acc = running_top5_correct / max(1, running_count)
         
-        print(f"Epoch {epoch:03d} | E_free={avg_E_1:.4f} | E_nudged={avg_E_2:.4f} | loss={avg_loss:.4f} | train_acc={train_acc*100:.2f}% | test_acc={acc*100:.2f}%")
+        print(f"Epoch {epoch:03d} | E_free={avg_E_free:.4f} | E_nudged={avg_E_1:.4f} | loss={avg_loss:.4f} | train_acc={train_acc*100:.2f}% | test_acc={acc*100:.2f}%")
         
         # Log metrics to wandb
         if wandb.run is not None:
             log_dict = {
                 # Core training metrics
-                "Energy/train": avg_E_1,
-                "Energy_nudged/train": avg_E_2,
+                "Energy/inference": avg_E_free,  # Free equilibrium energy (matches original EquiProp)
+                "Energy_nudged_pos/train": avg_E_1,  # Positive nudged equilibrium energy
+                "Energy_nudged_neg/train": avg_E_2,  # Negative nudged equilibrium energy
                 "Cost/train": avg_loss,
                 "Error/train": (1.0 - train_acc) * 100,
                 "Top5Error/train": (1.0 - train_top5_acc) * 100,

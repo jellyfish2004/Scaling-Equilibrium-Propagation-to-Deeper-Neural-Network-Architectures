@@ -146,7 +146,7 @@ class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
 
 
 class ResNet13_Interactions(InteractionBaseHopfieldModel):
-    def __init__(self, num_inputs=3, num_outputs=10, activation=hard_sigmoid):
+    def __init__(self, num_inputs=3, num_outputs=10, activation=relu6):
         nn.Module.__init__(self)
 
         weight_gains = [
@@ -163,36 +163,36 @@ class ResNet13_Interactions(InteractionBaseHopfieldModel):
             InteractionConv2d(3, 128, 3, h_out=32, w_out=32, stride=1, padding=1,
                               weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
             InteractionConv2d(128, 128, 3, h_out=16, w_out=16, stride=2, padding=1,
-                              weight_gain=weight_gains[0], bias_gain=bias_gains[1]),
+                              weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
             InteractionConv2d(3, 128, 1, h_out=16, w_out=16, stride=2, padding=0,
-                              weight_gain=weight_gains[0], bias=False),
+                              weight_gain=weight_gains[2], bias=False),
             
             # Block 2
             InteractionConv2d(128, 256, 3, h_out=16, w_out=16, stride=1, padding=1,
-                              weight_gain=weight_gains[1], bias_gain=bias_gains[2]),
+                              weight_gain=weight_gains[3], bias_gain=bias_gains[2]),
             InteractionConv2d(128, 256, 1, h_out=8, w_out=8, stride=2, padding=0,
-                              weight_gain=weight_gains[1], bias=False), # Skip (2,4) moved up
+                              weight_gain=weight_gains[4], bias=False), # Skip (2,4)
             InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
-                              weight_gain=weight_gains[1], bias_gain=bias_gains[3]),
+                              weight_gain=weight_gains[5], bias_gain=bias_gains[3]),
             
             # Block 3
             InteractionConv2d(256, 512, 3, h_out=8, w_out=8, stride=1, padding=1,
-                              weight_gain=weight_gains[2], bias_gain=bias_gains[4]),
+                              weight_gain=weight_gains[6], bias_gain=bias_gains[4]),
             InteractionConv2d(256, 512, 1, h_out=4, w_out=4, stride=2, padding=0,
-                              weight_gain=weight_gains[2], bias=False), # Skip (4,6) moved up
+                              weight_gain=weight_gains[7], bias=False), # Skip (4,6)
             InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
-                              weight_gain=weight_gains[2], bias_gain=bias_gains[5]),
+                              weight_gain=weight_gains[8], bias_gain=bias_gains[5]),
             
             # Block 4
             InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=1, padding=1,
-                              weight_gain=weight_gains[3], bias_gain=bias_gains[6]),
+                              weight_gain=weight_gains[9], bias_gain=bias_gains[6]),
             InteractionConv2d(512, 512, 1, h_out=2, w_out=2, stride=2, padding=0,
-                              weight_gain=weight_gains[3], bias=False), # Skip (6,8) moved up
+                              weight_gain=weight_gains[10], bias=False), # Skip (6,8)
             InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
-                              weight_gain=weight_gains[3], bias_gain=bias_gains[7]),
+                              weight_gain=weight_gains[11], bias_gain=bias_gains[7]),
             
             InteractionLinear(512*2*2, num_outputs,
-                              weight_gain=weight_gains[4], bias_gain=bias_gains[8])
+                              weight_gain=weight_gains[12], bias_gain=bias_gains[8])
         ]
 
         state_shapes = [
@@ -361,6 +361,10 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     free_states = [s.detach() for s in free_states]
     logits_free = free_states[-1]
 
+    # Compute energy at free equilibrium
+    with torch.no_grad():
+        E_free = model.energy(x, free_states, beta=0.0).mean()
+
     # Centered nudging
     b1, b2, denom = compute_betas('centered', beta)
 
@@ -400,7 +404,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
         one_hot = F.one_hot(y, num_classes=logits_free.shape[1]).float()
         batch_loss = (0.5 * ((logits_free - one_hot) ** 2).sum(dim=1)).mean().item()
 
-    return float(E_1.item()), float(E_2.item()), logits_free, batch_loss, free_states
+    return float(E_free.item()), float(E_1.item()), float(E_2.item()), logits_free, batch_loss, free_states
 
 
 def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=None):
