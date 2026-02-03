@@ -58,6 +58,7 @@ class InteractionBaseHopfieldModel(nn.Module):
 
     @torch.no_grad()
     def minimize_step(self, x, states, beta=0.0, target=None, streams=None):
+        """Synchronous update: updates all layers at once."""
         pre_grads = [None] * len(self.connections)
         post_grads = [None] * len(self.connections)
         inputs = [x] + states
@@ -91,12 +92,148 @@ class InteractionBaseHopfieldModel(nn.Module):
             new_states.append(activation_fn(-grad))
         return new_states
 
-    def minimize(self, x, states, beta=0.0, target=None, n_iters=20, streams=None):
+    @torch.no_grad()
+    def minimize_step_partial(self, x, states, beta=0.0, target=None, layer_indices=None):
+        """Asynchronous update: updates only specified layer indices.
+        
+        This matches the original implementation's 'asynchronous' mode where
+        even layers are updated first, then odd layers.
+        
+        Args:
+            x: Input tensor
+            states: List of current state tensors
+            beta: Nudging coefficient
+            target: Target labels (for nudged phase)
+            layer_indices: List of layer indices to update (0-indexed)
+        """
+        if layer_indices is None:
+            layer_indices = list(range(len(states)))
+        
+        # Compute gradients using current states
+        pre_grads = [None] * len(self.connections)
+        post_grads = [None] * len(self.connections)
+        inputs = [x] + states
+        state_grads = [torch.zeros_like(s) for s in inputs]
+
+        for i, (interaction, link) in enumerate(self.connections):
+            grad_post, grad_pre = interaction.backward(inputs[link[0]], inputs[link[1]])
+            pre_grads[i] = grad_pre
+            post_grads[i] = grad_post
+
+        for i, (interaction, link) in enumerate(self.connections):
+            state_grads[link[0]] = state_grads[link[0]] + pre_grads[i]
+            state_grads[link[1]] = state_grads[link[1]] + post_grads[i]
+
+        state_grads = state_grads[1:]  # remove input gradient
+
+        # Add cost gradient on output state if nudged
+        if beta != 0.0 and target is not None:
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                cost_grad = F.softmax(logits, dim=1) - F.one_hot(target, num_classes=logits.shape[1]).float()
+            else:
+                one_hot_target = F.one_hot(target, num_classes=logits.shape[1]).float()
+                cost_grad = logits - one_hot_target
+            state_grads[-1] = state_grads[-1] + beta * cost_grad
+
+        # Update only the specified layers
+        new_states = list(states)  # copy
+        for i in layer_indices:
+            activation_fn = self.activations[i]
+            new_states[i] = activation_fn(-state_grads[i])
+        
+        return new_states
+
+    def minimize(self, x, states, beta=0.0, target=None, n_iters=20, mode='asynchronous', streams=None):
+        """Minimize energy with respect to states.
+        
+        Args:
+            x: Input tensor
+            states: Initial state tensors
+            beta: Nudging coefficient (0 for free phase)
+            target: Target labels (for nudged phase)
+            n_iters: Number of iterations
+            mode: 'synchronous', 'asynchronous', 'forward', or 'backward'
+                - synchronous: all layers updated at once
+                - asynchronous: even layers first, then odd layers (default, more stable)
+                - forward: layers updated one at a time, from first to last
+                - backward: layers updated one at a time, from last to first
+            streams: CUDA streams (unused, for compatibility)
+        
+        Returns:
+            List of equilibrated state tensors
+        """
         current_states = list(states)
-        for _ in range(n_iters):
-            current_states = self.minimize_step(x, current_states, beta, target, streams)
-            current_states = [s.clone() for s in current_states]
+        num_layers = len(current_states)
+        
+        if mode == 'asynchronous':
+            # Even layers first (0, 2, 4, ...), then odd layers (1, 3, ...)
+            even_indices = list(range(0, num_layers, 2))
+            odd_indices = list(range(1, num_layers, 2))
+            
+            for _ in range(n_iters):
+                # Update even layers
+                current_states = self.minimize_step_partial(x, current_states, beta, target, even_indices)
+                # Update odd layers
+                current_states = self.minimize_step_partial(x, current_states, beta, target, odd_indices)
+        elif mode == 'forward':
+            # Update layers one at a time, from first to last
+            for _ in range(n_iters):
+                for i in range(num_layers):
+                    current_states = self.minimize_step_partial(x, current_states, beta, target, [i])
+        elif mode == 'backward':
+            # Update layers one at a time, from last to first
+            for _ in range(n_iters):
+                for i in range(num_layers - 1, -1, -1):
+                    current_states = self.minimize_step_partial(x, current_states, beta, target, [i])
+        elif mode == 'synchronous':
+            # Synchronous mode: all layers updated at once (Jacobi style)
+            for _ in range(n_iters):
+                current_states = self.minimize_step(x, current_states, beta, target, streams)
+                current_states = [s.clone() for s in current_states]
+        else:
+            raise ValueError(f"expected 'forward', 'backward', 'synchronous' or 'asynchronous' but got {mode}")
+        
         return current_states
+
+    def compute_manual_gradients(self, x, states_pos, states_neg, beta_denominator):
+        """Compute EP gradients using manual gradient methods (no autograd).
+        
+        This matches the original implementation's gradient computation approach,
+        which computes gradients explicitly using analytical formulas.
+        
+        Args:
+            x: Input tensor
+            states_pos: States from positive nudged phase
+            states_neg: States from negative nudged phase  
+            beta_denominator: Denominator for gradient scaling (typically 2*beta for centered EP)
+            
+        Returns:
+            List of gradients in same order as self.parameters()
+        """
+        grads = []
+        inputs_pos = [x] + states_pos
+        inputs_neg = [x] + states_neg
+        
+        for interaction, link in self.connections:
+            pre_pos = inputs_pos[link[0]]
+            post_pos = inputs_pos[link[1]]
+            pre_neg = inputs_neg[link[0]]
+            post_neg = inputs_neg[link[1]]
+            
+            # Bias gradient first (model.parameters() returns bias before weight)
+            grad_b_pos = interaction.grad_bias(pre_pos, post_pos)
+            grad_b_neg = interaction.grad_bias(pre_neg, post_neg)
+            grad_b = (grad_b_pos - grad_b_neg) / beta_denominator
+            grads.append(grad_b)
+            
+            # Weight gradient second
+            grad_w_pos = interaction.grad_weight(pre_pos, post_pos)
+            grad_w_neg = interaction.grad_weight(pre_neg, post_neg)
+            grad_w = (grad_w_pos - grad_w_neg) / beta_denominator
+            grads.append(grad_w)
+        
+        return grads
 
 
 class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
@@ -348,7 +485,8 @@ class ResNet16_Interactions(InteractionBaseHopfieldModel):
 
 
 def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True,
-                         n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None):
+                         n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None,
+                         mode='asynchronous'):
     B = x.size(0)
     device = x.device
 
@@ -357,7 +495,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     else:
         states = model.create_states(B, device)
 
-    free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_free, streams=streams)
+    free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_free, mode=mode, streams=streams)
     free_states = [s.detach() for s in free_states]
     logits_free = free_states[-1]
 
@@ -369,7 +507,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     b1, b2, denom = compute_betas('centered', beta)
 
     # Phase 1
-    nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, streams=streams)
+    nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, mode=mode, streams=streams)
     nudged_states = [s.detach() for s in nudged_states]
 
     E_1 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
@@ -377,7 +515,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     grads_1 = torch.autograd.grad(E_1, model.parameters(), create_graph=False)
 
     # Phase 2 (restart from free)
-    nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, streams=streams)
+    nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, mode=mode, streams=streams)
     nudged_states = [s.detach() for s in nudged_states]
     E_2 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_2 = E_2.mean() if use_mean_reduction else E_2.sum()
@@ -404,7 +542,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
         one_hot = F.one_hot(y, num_classes=logits_free.shape[1]).float()
         batch_loss = (0.5 * ((logits_free - one_hot) ** 2).sum(dim=1)).mean().item()
 
-    return float(E_free.item()), float(E_1.item()), float(E_2.item()), logits_free, batch_loss, free_states
+    return float(E_free.item()), float(E_1.item()), float(E_2.item()), logits_free, batch_loss, nudged_states  # Match original: uses 2nd nudged phase states
 
 
 def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=None):
@@ -416,7 +554,7 @@ def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=N
         y = y.to(device)
         B = x.size(0)
         states = model.create_states(B, x.device)
-        free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_infer, streams=streams)
+        free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_infer, mode='asynchronous', streams=streams)
         logits = free_states[-1]
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()

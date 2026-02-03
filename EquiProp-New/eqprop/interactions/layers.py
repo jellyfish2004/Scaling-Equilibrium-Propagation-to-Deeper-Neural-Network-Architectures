@@ -85,6 +85,32 @@ class InteractionConv2d(Interaction):
 
         return grad_post, grad_pre
 
+    def grad_weight(self, pre, post):
+        """Manual gradient computation for conv weight (dE/dW).
+        
+        E = -<conv(pre, W), post>
+        dE/dW = -conv2d_weight(pre, post)  [averaged over batch]
+        """
+        with torch.no_grad():
+            W_shape = self.conv.weight.shape
+            return -F.grad.conv2d_weight(
+                input=pre,
+                weight_size=W_shape,
+                grad_output=post,
+                padding=self.conv.padding,
+                stride=self.conv.stride
+            ) / pre.shape[0]  # mean over batch
+
+    def grad_bias(self, pre, post):
+        """Manual gradient computation for bias (dE/db).
+        
+        E = -<bias, post>
+        dE/db = -mean(post, dim=(0, 2, 3))
+        """
+        with torch.no_grad():
+            # Average over batch and spatial dims, keep channel dim
+            return -post.mean(dim=0).sum(dim=(1, 2)).view(-1, 1, 1)
+
 
 class InteractionConvMaxPool2d(Interaction):
     def __init__(self, in_ch, out_ch, kernel_size, h_out, w_out,
@@ -155,6 +181,38 @@ class InteractionConvMaxPool2d(Interaction):
 
         return grad_post, grad_pre
 
+    def grad_weight(self, pre, post):
+        """Manual gradient computation for conv weight with maxpool.
+        
+        E = -<maxpool(conv(pre, W)), post>
+        Need to unpool post before computing weight gradient.
+        """
+        with torch.no_grad():
+            feat = self.conv(pre)
+            # pool with indices
+            feat_pooled, indices = F.max_pool2d(feat, 2, return_indices=True)
+            # unpool post
+            post_unpool = F.max_unpool2d(post, indices, kernel_size=2, stride=2, output_size=feat.shape)
+            
+            W_shape = self.conv.weight.shape
+            return -F.grad.conv2d_weight(
+                input=pre,
+                weight_size=W_shape,
+                grad_output=post_unpool,
+                padding=self.conv.padding,
+                stride=self.conv.stride
+            ) / pre.shape[0]  # mean over batch
+
+    def grad_bias(self, pre, post):
+        """Manual gradient computation for bias (dE/db).
+        
+        E = -<bias, post>
+        dE/db = -mean(post, dim=(0, 2, 3))
+        """
+        with torch.no_grad():
+            # Average over batch and spatial dims, keep channel dim
+            return -post.mean(dim=0).sum(dim=(1, 2)).view(-1, 1, 1)
+
 
 class InteractionLinear(Interaction):
     def __init__(self, in_features, out_features, bias=True, weight_gain=None, bias_gain=None):
@@ -202,3 +260,27 @@ class InteractionLinear(Interaction):
             grad_pre_flat = -torch.matmul(post, self.linear.weight)
             grad_pre = grad_pre_flat.reshape(pre.shape)
         return grad_post, grad_pre
+
+    def grad_weight(self, pre, post):
+        """Manual gradient computation for linear weight (dE/dW).
+        
+        E = -<W @ pre, post> = -pre.T @ post
+        dE/dW = -post.T @ pre / batch_size
+        """
+        with torch.no_grad():
+            if pre.dim() > 2:
+                pre_flat = pre.reshape(pre.size(0), -1).contiguous()
+            else:
+                pre_flat = pre
+            # W is (out_features, in_features), so gradient is (out_features, in_features)
+            # dE/dW = -post.T @ pre / B
+            return -torch.matmul(post.T, pre_flat) / pre.shape[0]
+
+    def grad_bias(self, pre, post):
+        """Manual gradient computation for bias (dE/db).
+        
+        E = -<bias, post>
+        dE/db = -mean(post, dim=0)
+        """
+        with torch.no_grad():
+            return -post.mean(dim=0)
