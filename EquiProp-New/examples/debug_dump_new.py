@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # Force Double Precision for Verification
-# torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float64)
 
 # Add paths
 current_dir = os.path.dirname(os.path.abspath(__file__))

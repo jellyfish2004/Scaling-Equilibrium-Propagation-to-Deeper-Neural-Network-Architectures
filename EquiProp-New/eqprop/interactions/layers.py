@@ -56,8 +56,8 @@ class InteractionConv2d(Interaction):
             self._stride_tuple = tuple(s)
 
     def create_state(self, batch_size, device):
-        # allocate in channels_last directly
-        state = torch.zeros(batch_size, self.conv.out_channels, self.h_out, self.w_out, device=device, requires_grad=False)#.contiguous(memory_format=torch.channels_last)
+        # allocate in default (channels_first) format for debugging
+        state = torch.zeros(batch_size, self.conv.out_channels, self.h_out, self.w_out, device=device, requires_grad=False)
         return state
 
     def energy(self, pre, post):
@@ -71,7 +71,7 @@ class InteractionConv2d(Interaction):
         with torch.no_grad():
             feat = self.conv(pre)
             bias = self.bias.view(1, -1, 1, 1)
-            grad_post = -(feat + bias)#.contiguous(memory_format=torch.channels_last)
+            grad_post = -(feat + bias)
 
             output_padding = (self._stride_tuple[0] - 1, self._stride_tuple[1] - 1)
 
@@ -81,7 +81,7 @@ class InteractionConv2d(Interaction):
                 stride=self.conv.stride,
                 padding=self.conv.padding,
                 output_padding=output_padding
-            )#.contiguous(memory_format=torch.channels_last)
+            )
 
         return grad_post, grad_pre
 
@@ -144,13 +144,12 @@ class InteractionConvMaxPool2d(Interaction):
 
     def create_state(self, batch_size, device):
         state = torch.zeros(batch_size, self.conv.out_channels, self.h_out, self.w_out,
-                            device=device, requires_grad=False)#.contiguous(memory_format=torch.channels_last)
+                            device=device, requires_grad=False)
         return state
 
     def energy(self, pre, post):
         feat = self.conv(pre)
         feat_pooled = F.max_pool2d(feat, 2)
-        feat_pooled = feat_pooled#.contiguous(memory_format=torch.channels_last)
         e = -(feat_pooled * post).sum(dim=(1, 2, 3))
         bias = self.bias.view(1, -1, 1, 1)
         e += -(bias * post).sum(dim=(1, 2, 3))
@@ -161,14 +160,12 @@ class InteractionConvMaxPool2d(Interaction):
             feat = self.conv(pre)
             # pool with indices to be able to unpool deterministically
             feat_pooled, indices = F.max_pool2d(feat, 2, return_indices=True)
-            feat_pooled = feat_pooled#.contiguous(memory_format=torch.channels_last)
 
             bias = self.bias.view(1, -1, 1, 1)
-            grad_post = -(feat_pooled + bias)#.contiguous(memory_format=torch.channels_last)
+            grad_post = -(feat_pooled + bias)
 
             # unpool into the original feat shape
             post_unpool = F.max_unpool2d(post, indices, kernel_size=2, stride=2, output_size=feat.shape)
-            post_unpool = post_unpool#.contiguous(memory_format=torch.channels_last)
 
             output_padding = (self._stride_tuple[0] - 1, self._stride_tuple[1] - 1)
             grad_pre = -F.conv_transpose2d(
