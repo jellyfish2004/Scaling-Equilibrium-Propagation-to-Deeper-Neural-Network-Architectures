@@ -56,6 +56,32 @@ class InteractionBaseHopfieldModel(nn.Module):
                 E = E + beta * 0.5 * (diff * diff).sum(dim=1)
         return E
 
+    def layerwise_energies(self, x, states, beta=0.0, target=None):
+        """Compute total energy and return per-layer breakdown for logging."""
+        energies = []
+        E = 0
+        inputs = [x] + states
+        for i, (interaction, link) in enumerate(self.connections):
+            layer_energy = interaction.energy(inputs[link[0]], inputs[link[1]])
+            energies.append(layer_energy.mean().item())
+            E = E + layer_energy
+        if beta != 0.0 and target is not None:
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                log_probs = F.log_softmax(logits, dim=1)
+                cost_energy = beta * (-(log_probs.gather(1, target.view(-1, 1)).squeeze(1)))
+                E = E + cost_energy
+            else:
+                if target.dim() == 1:
+                    one_hot = F.one_hot(target, num_classes=logits.shape[1]).float()
+                else:
+                    one_hot = target.float()
+                diff = logits - one_hot
+                cost_energy = beta * 0.5 * (diff * diff).sum(dim=1)
+                E = E + cost_energy
+            energies.append(cost_energy.mean().item())
+        return E, energies
+
     @torch.no_grad()
     def minimize_step(self, x, states, beta=0.0, target=None, streams=None):
         """Synchronous update: updates all layers at once."""
@@ -499,9 +525,10 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     free_states = [s.detach() for s in free_states]
     logits_free = free_states[-1]
 
-    # Compute energy at free equilibrium
+    # Compute energy at free equilibrium with layerwise breakdown
     with torch.no_grad():
-        E_free = model.energy(x, free_states, beta=0.0).mean()
+        E_free_tensor, layerwise_energies = model.layerwise_energies(x, free_states, beta=0.0)
+        E_free = E_free_tensor.mean().item()
 
     # Centered nudging
     b1, b2, denom = compute_betas('centered', beta)
@@ -542,7 +569,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
         one_hot = F.one_hot(y, num_classes=logits_free.shape[1]).float()
         batch_loss = (0.5 * ((logits_free - one_hot) ** 2).sum(dim=1)).mean().item()
 
-    return float(E_free.item()), float(E_1.item()), float(E_2.item()), logits_free, batch_loss, nudged_states  # Match original: uses 2nd nudged phase states
+    return E_free, float(E_1.item()), logits_free, batch_loss, nudged_states, free_states, layerwise_energies
 
 
 def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=None):
@@ -550,7 +577,7 @@ def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=N
     total = 0
     correct = 0
     for x, y in tqdm(dataloader):
-        x = x.to(device, memory_format=torch.channels_last)
+        x = x.to(device)
         y = y.to(device)
         B = x.size(0)
         states = model.create_states(B, x.device)
