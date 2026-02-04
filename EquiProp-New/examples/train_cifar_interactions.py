@@ -67,7 +67,7 @@ def evaluate_with_stats(model, dataloader, device: str, n_iters_infer: int = 120
     saturation_accumulators = {}
     
     for x, y in tqdm(dataloader, desc="Evaluating"):
-        x = x.to(device, memory_format=torch.channels_last)
+        x = x.to(device)#, memory_format=torch.channels_last)
         y = y.to(device)
         B = x.size(0)
         states = model.create_states(B, device)
@@ -179,7 +179,7 @@ def _train_loop():
     
     model.cost_type = args.cost
     model.to(device)
-    model = model.to(memory_format=torch.channels_last)
+    model = model#.to(memory_format=torch.channels_last)
 
     if args.compile:
         # Compile top-level methods for better graph optimization
@@ -259,7 +259,7 @@ def _train_loop():
             iterator = tqdm(train_loader, desc=f"Epoch {epoch:03d}")
         previous_states = None
         for step, (x, y) in enumerate(iterator):
-            x = x.to(device, memory_format=torch.channels_last)
+            x = x.to(device)#, memory_format=torch.channels_last)
             y = y.to(device)
             E_free, E_1, E_2, logits_free, batch_loss, previous_states = train_batch_centered(
                 model, x, y, optimizer,

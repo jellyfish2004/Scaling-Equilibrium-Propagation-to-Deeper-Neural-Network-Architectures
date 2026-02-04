@@ -392,7 +392,7 @@ def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=Tr
     else:
         one_hot = F.one_hot(y, num_classes=logits_free.shape[1]).float()
         batch_loss = (0.5 * ((logits_free - one_hot) ** 2).sum(dim=1)).mean().item()
-    return float(E_1.item()), float(E_2.item()), logits_free, batch_loss, free_states
+    return float(E_1.item()), float(E_2.item()), logits_free, batch_loss, nudged_states  # Match original: uses 2nd nudged phase states
 
 
 def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=None):

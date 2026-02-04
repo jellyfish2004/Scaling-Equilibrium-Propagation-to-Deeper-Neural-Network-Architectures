@@ -550,7 +550,7 @@ def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=N
     total = 0
     correct = 0
     for x, y in tqdm(dataloader):
-        x = x.to(device, memory_format=torch.channels_last)
+        x = x.to(device)#, memory_format=torch.channels_last)
         y = y.to(device)
         B = x.size(0)
         states = model.create_states(B, x.device)
