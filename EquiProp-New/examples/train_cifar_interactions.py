@@ -7,9 +7,15 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional
 from tqdm import tqdm
 import argparse
-import wandb
+# import wandb
 
-from eqprop.interactions.core import (
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(current_dir, "../.."))
+eqprop_new_dir = os.path.join(root_dir, "EquiProp-New")
+print(eqprop_new_dir)
+sys.path.insert(0, eqprop_new_dir)
+
+from eqprop.core import (
     train_batch_centered, evaluate, 
     ConvHopfieldEnergy32_Interactions, 
     ResNet13_Interactions, 
@@ -221,11 +227,6 @@ def _train_loop():
     
     model.cost_type = args.cost
     model.to(device)
-    # Note: channels_last removed for parity with original EquiProp
-
-    if args.compile:
-        model.energy = torch.compile(model.energy, options={"epilogue_fusion": True, "max_autotune": True})
-        model.minimize_step = torch.compile(model.minimize_step, options={"epilogue_fusion": True, "max_autotune": True, "triton.cudagraphs": True})
 
     # Optimizer and scheduler
     optimizer = _sgd_optimizer(model, lr_weights=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -233,6 +234,24 @@ def _train_loop():
     scheduler = None
     if args.cosine_annealing:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=2e-6)
+
+    if args.compile:
+        model._precompute_async_plan()
+        model.energy = torch.compile(model.energy, options={"epilogue_fusion": True, "max_autotune": True})
+        model.minimize = torch.compile(model.minimize, options={"epilogue_fusion": True, "max_autotune": True, "triton.cudagraphs": False})
+        # warmup
+        x = torch.randn(args.batch_size, 3, 32, 32, device=device)
+        y = torch.randint(0, 10, (args.batch_size,), device=device)
+        for i in range(3):
+            _, _, _, _, _, _, _ = train_batch_centered(
+                model, x, y, optimizer,
+                beta=args.beta, use_mean_reduction=True,
+                n_iters_free=args.iters_infer, n_iters_nudged=args.iters_train,
+                streams=None,
+                previous_states=None,
+                grad_clip=1.0,
+                mode=args.mode
+            )
 
     # Resume from checkpoint if specified
     start_epoch = 1
@@ -335,7 +354,7 @@ def _train_loop():
             running_E_nudged += E_nudged
             
             # Per-batch logging
-            if args.log_batch_every > 0 and step % args.log_batch_every == 0 and wandb.run:
+            if not args.no_wandb and args.log_batch_every > 0 and step % args.log_batch_every == 0 and wandb.run:
                 batch_log = {
                     "Energy/batch": E_free,
                     "Energy_nudged/batch": E_nudged,
@@ -353,7 +372,7 @@ def _train_loop():
                 wandb.log(batch_log, step=global_step)
             
             # Accumulate stats for epoch-level logging
-            if wandb.run:
+            if not args.no_wandb and wandb.run:
                 for k, v in compute_state_norms(free_states).items():
                     train_norm_accumulators[k] = train_norm_accumulators.get(k, 0.0) + v
                 for k, v in compute_state_saturations(free_states).items():
@@ -372,7 +391,7 @@ def _train_loop():
             global_step += 1
         
         # Evaluation
-        if wandb.run:
+        if not args.no_wandb and wandb.run:
             acc, test_stats = evaluate_with_stats(model, test_loader, device=device, 
                                                   n_iters_infer=args.iters_infer, streams=streams, mode=args.mode)
         else:
@@ -391,7 +410,7 @@ def _train_loop():
               f"loss={avg_loss:.4f} | train_acc={train_acc*100:.2f}% | test_acc={acc*100:.2f}%")
         
         # Epoch-level wandb logging
-        if wandb.run:
+        if not args.no_wandb and wandb.run:
             log_dict = {
                 "Energy/train": avg_E_free,
                 "Energy_nudged/train": avg_E_nudged,

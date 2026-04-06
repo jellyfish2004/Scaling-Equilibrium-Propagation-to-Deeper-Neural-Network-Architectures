@@ -33,7 +33,7 @@ class Parameter(Variable, ABC):
 
         Variable.__init__(self, shape)
 
-        self._state = torch.empty(*shape, dtype=torch.float32, device=device)
+        self._state = torch.empty(*shape, dtype=torch.get_default_dtype(), device=device)
         self._non_negative = non_negative
 
     def get(self):

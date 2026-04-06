@@ -1,398 +1,691 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 import numpy as np
-import random
-from .layers import EqPropConv2d, EqPropLinear, ResBlock, EqPropConvMaxPool2d, identity
-from .functional import compute_betas
+import inspect
+from tqdm import tqdm
+from eqprop.functional import compute_betas
+from eqprop.activation import hard_sigmoid, identity, relu6
+from eqprop.layers import InteractionConv2d, InteractionConvMaxPool2d, InteractionLinear
 
-torch.set_float32_matmul_precision('high')
-
-class BaseHopfieldModel(nn.Module):
-    def __init__(self):
+class InteractionBaseHopfieldModel(nn.Module):
+    def __init__(self, state_shapes, interactions, connections, activations):
         super().__init__()
+        self.n_states = len(state_shapes)
+        self.state_shapes = state_shapes
+        self.interactions = nn.ModuleList(interactions)
+        self.connections = connections  # [(interaction, (src_idx, dst_idx)), ...]
+        self.activations = activations  # list of functions for each state
+
+        if len(self.activations) != self.n_states:
+            raise ValueError("Number of activations must match number of states")
+
+        self.cost_type = 'MSE'  # default
 
     def create_states(self, batch_size, device):
-        return [layer.create_state(batch_size, device) for layer in self.layers]
+        states = [None] * self.n_states
+        for interaction, link in self.connections:
+            idx = link[1] - 1
+            if 0 <= idx < self.n_states:
+                if states[idx] is None:
+                    states[idx] = interaction.create_state(batch_size, device)
+        # fill any remaining None states with zeros (defensive)
+        for i in range(len(states)):
+            if states[i] is None:
+                shape = self.state_shapes[i]
+                device = states[0].device if states[0] is not None else torch.device("cpu")
+                states[i] = torch.zeros((batch_size, *shape), device=device, requires_grad=False)
+        return states
 
-    def energy(self, x, states, beta=0.0, target=None, streams=None):
+    def energy(self, x, states, beta=0.0, target=None):
         E = 0
-        inputs = [x] + [states[i][-1] for i in range(len(self.layers))]
-        if streams is None:
-            for i, layer in enumerate(self.layers):
-                with torch.cuda.nvtx.range(f"Layer {i} Energy"):
-                    E += layer.energy(inputs[i], states[i])
-        else:
-            energies = [None] * len(self.layers)
-            torch.cuda.synchronize()
-            for i, layer in enumerate(self.layers):
-                stream = streams[i]
-                with torch.cuda.stream(stream):
-                    with torch.cuda.nvtx.range(f"Layer {i} Energy"):
-                        energies[i] = layer.energy(inputs[i], states[i])
-            torch.cuda.synchronize()
-        
-            E = torch.stack(energies).sum(0)
-
-
+        inputs = [x] + states
+        for i, (interaction, link) in enumerate(self.connections):
+            E = E + interaction.energy(inputs[link[0]], inputs[link[1]])
         if beta != 0.0 and target is not None:
-            with torch.cuda.nvtx.range("Cost Energy Calculation"):
-                logits = states[-1][-1]  # Output state is always last element of last layer
-                if self.cost_type == 'CE':
-                    # Expect target as class indices of shape (B,)
-                    log_probs = F.log_softmax(logits, dim=1)
-                    E += beta * (-(log_probs.gather(1, target.view(-1, 1)).squeeze(1)))
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                log_probs = F.log_softmax(logits, dim=1)
+                E = E + beta * (-(log_probs.gather(1, target.view(-1, 1)).squeeze(1)))
+            else:
+                if target.dim() == 1:
+                    one_hot = F.one_hot(target, num_classes=logits.shape[1]).float()
                 else:
-                    # MSE on logits vs one-hot target; accept either class indices or one-hot
-                    if target.dim() == 1:
-                        one_hot = F.one_hot(target, num_classes=logits.shape[1]).float()
-                    else:
-                        one_hot = target.float()
-                    E += beta * 0.5 * ((logits - one_hot) ** 2).sum(dim=1)
+                    one_hot = target.float()
+                diff = logits - one_hot
+                E = E + beta * 0.5 * (diff * diff).sum(dim=1)
         return E
+
+    def layerwise_energies(self, x, states, beta=0.0, target=None):
+        """Compute total energy and return per-layer breakdown for logging."""
+        energies = []
+        E = 0
+        inputs = [x] + states
+        for i, (interaction, link) in enumerate(self.connections):
+            layer_energy = interaction.energy(inputs[link[0]], inputs[link[1]])
+            energies.append(layer_energy.mean().item())
+            E = E + layer_energy
+        if beta != 0.0 and target is not None:
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                log_probs = F.log_softmax(logits, dim=1)
+                cost_energy = beta * (-(log_probs.gather(1, target.view(-1, 1)).squeeze(1)))
+                E = E + cost_energy
+            else:
+                if target.dim() == 1:
+                    one_hot = F.one_hot(target, num_classes=logits.shape[1]).float()
+                else:
+                    one_hot = target.float()
+                diff = logits - one_hot
+                cost_energy = beta * 0.5 * (diff * diff).sum(dim=1)
+                E = E + cost_energy
+            energies.append(cost_energy.mean().item())
+        return E, energies
 
     @torch.no_grad()
     def minimize_step(self, x, states, beta=0.0, target=None, streams=None):
-        n_layers = len(self.layers)
-        pre_grads = [None] * n_layers
-        post_grads = [None] * n_layers
-        # Build inputs list: [x, output_state_0, output_state_1, ...]
-        # All layers return list of states; output is always last element
-        # Run all layer backwards, in serial or parallel
-        inputs = [x] + [states[i][-1] for i in range(n_layers)]
+        """Synchronous update: updates all layers at once."""
+        pre_grads = [None] * len(self.connections)
+        post_grads = [None] * len(self.connections)
+        inputs = [x] + states
+        state_grads = [torch.zeros_like(s) for s in inputs] # incl input here
 
-        if streams is None:
-            for i, layer in enumerate(self.layers):
-                torch.cuda.nvtx.range_push(f"Layer {i}")
-                grad_states, grad_pre = layer.backward(inputs[i], states[i])
-                torch.cuda.nvtx.range_pop()
-                if i != 0:
-                    pre_grads[i-1] = grad_pre
-                post_grads[i] = grad_states
-            output_state = states[-1][-1]
-            pre_grads[-1] = torch.zeros_like(output_state) # last layer is always linear 
-        else:
-            torch.cuda.synchronize()      
-            # Launch all backward passes in different streams
-            for i, layer in enumerate(self.layers):
-                stream = streams[i]
-                with torch.cuda.stream(stream):
-                    torch.cuda.nvtx.range_push(f"Layer {i}")
-                    grad_states, grad_pre = layer.backward(inputs[i], states[i])
-                    torch.cuda.nvtx.range_pop()
-                    if i != 0:
-                        pre_grads[i-1] = grad_pre
-                    post_grads[i] = grad_states
-            torch.cuda.synchronize()
-            
-            output_state = states[-1][-1]
-            pre_grads[-1] = torch.zeros_like(output_state) # last layer is always linear
+        for i, (interaction, link) in enumerate(self.connections):
+            grad_post, grad_pre = interaction.backward(inputs[link[0]], inputs[link[1]])
+            pre_grads[i] = grad_pre
+            post_grads[i] = grad_post
 
-        # Combine post and pre grads - all post_grads are lists, pre_grad applies to last element
-        state_grads = []
-        for i in range(n_layers):
-            post_grad_list = post_grads[i]  # Always a list
-            pre_grad = pre_grads[i]
-            # pre_grad applies to last element of the state list
-            combined = list(post_grad_list)  # Copy list
-            if pre_grad is not None:
-                combined[-1] = combined[-1] + pre_grad
-            state_grads.append(combined)
-        
-        # Add cost on output layer if needed
+        for i, (interaction, link) in enumerate(self.connections):
+            state_grads[link[0]] = state_grads[link[0]] + pre_grads[i]
+            state_grads[link[1]] = state_grads[link[1]] + post_grads[i]
+
+        state_grads = state_grads[1:] # remove input
+
+        # add cost gradient on output state if nudged
         if beta != 0.0 and target is not None:
-            logits = states[-1][-1]  # Output state is always last element of last layer
+            logits = states[-1]
             if self.cost_type == 'CE':
                 cost_grad = F.softmax(logits, dim=1) - F.one_hot(target, num_classes=logits.shape[1]).float()
-            else: # MSE
+            else:
                 one_hot_target = F.one_hot(target, num_classes=logits.shape[1]).float()
                 cost_grad = logits - one_hot_target
-            # Apply cost to the last element of state_grads[-1]
-            state_grads[-1][-1] = state_grads[-1][-1] + beta * cost_grad
-        
-        # Update states using layer.update_state
+            state_grads[-1] = state_grads[-1] + beta * cost_grad
+
+        # Clamp and update with activation functions
         new_states = []
-        for i, layer in enumerate(self.layers):
-            # Pass the gradients for this layer's states
-            new_state_list = layer.update_state(state_grads[i])
-            new_states.append(new_state_list)
-            
+        for i, grad in enumerate(state_grads):
+            activation_fn = self.activations[i]
+            new_states.append(activation_fn(-grad))
         return new_states
 
-    def minimize(self, x, states, beta=0.0, target=None, n_iters=20, streams=None):
-        current_states = list(states)
+    @torch.no_grad()
+    def minimize_step_partial(self, x, states, beta=0.0, target=None, layer_indices=None):
+        """Asynchronous update: updates only specified layer indices.
+        
+        Optimized to only compute the gradients needed for the specified layers.
+        For each interaction, we call backward_post() and/or backward_pre()
+        only when the corresponding state is in the update set.
+        
+        Args:
+            x: Input tensor
+            states: List of current state tensors
+            beta: Nudging coefficient
+            target: Target labels (for nudged phase)
+            layer_indices: List of layer indices to update (0-indexed)
+        """
+        if layer_indices is None:
+            layer_indices = list(range(len(states)))
+        
+        layer_set = set(layer_indices)
+        inputs = [x] + states
+        state_grads = [torch.zeros_like(s) for s in states]
 
-        for cnt in range(n_iters):
-            torch.cuda.nvtx.range_push(f"[{cnt}] Minimize Step")
-            current_states = self.minimize_step(x, current_states, beta, target, streams)
-            torch.cuda.nvtx.range_pop()
+        for i, (interaction, link) in enumerate(self.connections):
+            src, dst = link
+            # dst-1 converts from inputs-index to states-index
+            # src-1 converts from inputs-index to states-index (src=0 is input, never updated)
+            need_post = (dst - 1) in layer_set
+            need_pre  = (src - 1) in layer_set and src != 0
+
+            if not need_post and not need_pre:
+                continue  # skip entirely
+
+            if need_post and need_pre:
+                # Need both — use combined backward() to share forward conv
+                grad_post, grad_pre = interaction.backward(inputs[src], inputs[dst])
+                state_grads[dst - 1] = state_grads[dst - 1] + grad_post
+                state_grads[src - 1] = state_grads[src - 1] + grad_pre
+            elif need_post:
+                grad_post = interaction.backward_post(inputs[src], inputs[dst])
+                state_grads[dst - 1] = state_grads[dst - 1] + grad_post
+            else:  # need_pre only
+                grad_pre = interaction.backward_pre(inputs[src], inputs[dst])
+                state_grads[src - 1] = state_grads[src - 1] + grad_pre
+
+        # Add cost gradient on output state if nudged
+        if beta != 0.0 and target is not None and (len(states) - 1) in layer_set:
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                cost_grad = F.softmax(logits, dim=1) - F.one_hot(target, num_classes=logits.shape[1]).float()
+            else:
+                one_hot_target = F.one_hot(target, num_classes=logits.shape[1]).float()
+                cost_grad = logits - one_hot_target
+            state_grads[-1] = state_grads[-1] + beta * cost_grad
+
+        # Update only the specified layers
+        new_states = list(states)  # copy
+        for i in layer_indices:
+            activation_fn = self.activations[i]
+            new_states[i] = activation_fn(-state_grads[i])
+        
+        return new_states
+
+    def _precompute_async_plan(self):
+        """Pre-compute execution plans for async (even/odd) updates.
+        
+        Stored as tuples-of-tuples so torch.compile treats them as constants.
+        Each entry is (interaction_index, src, dst, grad_type) where:
+            grad_type: 0 = post only, 1 = pre only, 2 = both
+        """
+        print("Precomputing async plan ---------------------------------------------------------")
+        num_layers = self.n_states
+        even_set = set(range(0, num_layers, 2))
+        odd_set = set(range(1, num_layers, 2))
+        
+        even_plan = []
+        odd_plan = []
+        
+        for i, (interaction, link) in enumerate(self.connections):
+            src, dst = link
+            
+            # Even plan
+            need_post_e = (dst - 1) in even_set
+            need_pre_e = (src - 1) in even_set and src != 0
+            if need_post_e and need_pre_e:
+                even_plan.append((i, src, dst, 2))
+            elif need_post_e:
+                even_plan.append((i, src, dst, 0))
+            elif need_pre_e:
+                even_plan.append((i, src, dst, 1))
+            
+            # Odd plan
+            need_post_o = (dst - 1) in odd_set
+            need_pre_o = (src - 1) in odd_set and src != 0
+            if need_post_o and need_pre_o:
+                odd_plan.append((i, src, dst, 2))
+            elif need_post_o:
+                odd_plan.append((i, src, dst, 0))
+            elif need_pre_o:
+                odd_plan.append((i, src, dst, 1))
+        
+        # Store as tuples (immutable → compile-time constants)
+        self._even_plan = tuple(even_plan)
+        self._odd_plan = tuple(odd_plan)
+        self._even_indices = tuple(range(0, num_layers, 2))
+        self._odd_indices = tuple(range(1, num_layers, 2))
+        self._update_output_even = (num_layers - 1) % 2 == 0
+        self._update_output_odd = (num_layers - 1) % 2 == 1
+
+    @torch.no_grad()
+    def _run_plan(self, x, states, plan, update_indices, update_output, beta=0.0, target=None):
+        """Execute a pre-computed async plan. No set lookups, no dynamic dispatch.
+        
+        Each plan entry is (interaction_idx, src, dst, grad_type).
+        grad_type: 0=post_only, 1=pre_only, 2=both
+        
+        This method is designed to be torch.compile friendly:
+        - plan and update_indices are tuples (compile-time constants)
+        - No set(), no dynamic branching on layer_indices
+        - grad_type branching is on integer constants that compile specializes on
+        """
+        inputs = [x] + states
+        state_grads = [torch.zeros_like(s) for s in states]
+
+        for idx, src, dst, grad_type in plan:
+            interaction = self.interactions[idx]
+            if grad_type == 2:
+                grad_post, grad_pre = interaction.backward(inputs[src], inputs[dst])
+                state_grads[dst - 1] = state_grads[dst - 1] + grad_post
+                state_grads[src - 1] = state_grads[src - 1] + grad_pre
+            elif grad_type == 0:
+                grad_post = interaction.backward_post(inputs[src], inputs[dst])
+                state_grads[dst - 1] = state_grads[dst - 1] + grad_post
+            else:  # grad_type == 1
+                grad_pre = interaction.backward_pre(inputs[src], inputs[dst])
+                state_grads[src - 1] = state_grads[src - 1] + grad_pre
+
+        # Cost gradient (only if output layer is in update set)
+        if beta != 0.0 and target is not None and update_output:
+            logits = states[-1]
+            if self.cost_type == 'CE':
+                cost_grad = F.softmax(logits, dim=1) - F.one_hot(target, num_classes=logits.shape[1]).float()
+            else:
+                one_hot_target = F.one_hot(target, num_classes=logits.shape[1]).float()
+                cost_grad = logits - one_hot_target
+            state_grads[-1] = state_grads[-1] + beta * cost_grad
+
+        # Update only specified layers
+        new_states = list(states)
+        for i in update_indices:
+            new_states[i] = self.activations[i](-state_grads[i])
+        
+        return new_states
+
+    @torch.no_grad()
+    def minimize_step_async(self, x, states, beta=0.0, target=None):
+        """One full async iteration: even update then odd update.
+        
+        Uses pre-computed plans for torch.compile compatibility.
+        Single method call per iteration (vs 2 calls to minimize_step_partial).
+        """
+        # Even half-step
+        states = self._run_plan(x, states, self._even_plan, self._even_indices,
+                                self._update_output_even, beta, target)
+        # Odd half-step
+        states = self._run_plan(x, states, self._odd_plan, self._odd_indices,
+                                self._update_output_odd, beta, target)
+        return states
+
+    def minimize(self, x, states, beta=0.0, target=None, n_iters=20, mode='asynchronous', streams=None):
+        """Minimize energy with respect to states.
+        
+        Args:
+            x: Input tensor
+            states: Initial state tensors
+            beta: Nudging coefficient (0 for free phase)
+            target: Target labels (for nudged phase)
+            n_iters: Number of iterations
+            mode: 'synchronous', 'asynchronous', 'forward', or 'backward'
+                - synchronous: all layers updated at once
+                - asynchronous: even layers first, then odd layers (default, more stable)
+                - forward: layers updated one at a time, from first to last
+                - backward: layers updated one at a time, from last to first
+            streams: CUDA streams (unused, for compatibility)
+        
+        Returns:
+            List of equilibrated state tensors
+        """
+        current_states = list(states)
+        num_layers = len(current_states)
+        
+        if mode == 'asynchronous':
+            # Ensure plans are pre-computed
+            if not hasattr(self, '_even_plan'):
+                self._precompute_async_plan()
+            
+            for _ in range(n_iters):
+                current_states = self.minimize_step_async(x, current_states, beta, target)
+                current_states = [s.clone() for s in current_states]
+        elif mode == 'forward':
+            # Update layers one at a time, from first to last
+            for _ in range(n_iters):
+                for i in range(num_layers):
+                    current_states = self.minimize_step_partial(x, current_states, beta, target, [i])
+                    current_states = [s.clone() for s in current_states]
+        elif mode == 'backward':
+            # Update layers one at a time, from last to first
+            for _ in range(n_iters):
+                for i in range(num_layers - 1, -1, -1):
+                    current_states = self.minimize_step_partial(x, current_states, beta, target, [i])
+                    current_states = [s.clone() for s in current_states]
+        elif mode == 'synchronous':
+            # Synchronous mode: all layers updated at once (Jacobi style)
+            for _ in range(n_iters):
+                current_states = self.minimize_step(x, current_states, beta, target, streams)
+                current_states = [s.clone() for s in current_states]
+        else:
+            raise ValueError(f"expected 'forward', 'backward', 'synchronous' or 'asynchronous' but got {mode}")
+        
         return current_states
 
-
-class ConvHopfieldEnergy32(BaseHopfieldModel):
-    def __init__(self):
-        super().__init__()
-        weight_gains = [0.4, 0.7, 0.6, 0.3, 0.4]
-        bias_gains   = [
-            0.5 / ( (3   * 3 * 3) ** 0.5 ),
-            0.5 / ( (128 * 3 * 3) ** 0.5 ),
-            0.5 / ( (256 * 3 * 3) ** 0.5 ),
-            0.5 / ( (512 * 3 * 3) ** 0.5 ),
-            0.5 / ( (512 * 2 * 2) ** 0.5 ),
-        ]
-        self.layers = nn.ModuleList([
-            EqPropConvMaxPool2d(3,   128, 3, h_out=16, w_out=16, padding=1, weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
-            EqPropConvMaxPool2d(128, 256, 3, h_out=8,  w_out=8,  padding=1, weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
-            EqPropConvMaxPool2d(256, 512, 3, h_out=4,  w_out=4,  padding=1, weight_gain=weight_gains[2], bias_gain=bias_gains[2]),
-            EqPropConvMaxPool2d(512, 512, 3, h_out=2,  w_out=2,  padding=1, weight_gain=weight_gains[3], bias_gain=bias_gains[3]),
-            EqPropLinear(512*2*2, 10, weight_gain=weight_gains[4], bias_gain=bias_gains[4], activation=identity)
-        ])
-        self.output = self.layers[-1]
-        self.cost_type = 'CE'
-
-        self.reinit_like_original() # for reproducibility
-
-    def reinit_like_original(self, seed: int = 0):
-        """Reinitialize parameters to exactly match original main.py draw order.
-        Order: all biases (b1..b5), then conv weights (W1..W4), then dense W5 drawn
-        as (512,2,2,10) and permuted to (10,2048).
+    def compute_manual_gradients(self, x, states_pos, states_neg, beta_denominator):
+        """Compute EP gradients using manual gradient methods (no autograd).
+        
+        This matches the original implementation's gradient computation approach,
+        which computes gradients explicitly using analytical formulas.
+        
+        Args:
+            x: Input tensor
+            states_pos: States from positive nudged phase
+            states_neg: States from negative nudged phase  
+            beta_denominator: Denominator for gradient scaling (typically 2*beta for centered EP)
+            
+        Returns:
+            List of gradients in same order as self.parameters()
         """
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        grads = []
+        inputs_pos = [x] + states_pos
+        inputs_neg = [x] + states_neg
+        
+        for interaction, link in self.connections:
+            pre_pos = inputs_pos[link[0]]
+            post_pos = inputs_pos[link[1]]
+            pre_neg = inputs_neg[link[0]]
+            post_neg = inputs_neg[link[1]]
+            
+            # Bias gradient first (model.parameters() returns bias before weight)
+            grad_b_pos = interaction.grad_bias(pre_pos, post_pos)
+            grad_b_neg = interaction.grad_bias(pre_neg, post_neg)
+            grad_b = (grad_b_pos - grad_b_neg) / beta_denominator
+            grads.append(grad_b)
+            
+            # Weight gradient second
+            grad_w_pos = interaction.grad_weight(pre_pos, post_pos)
+            grad_w_neg = interaction.grad_weight(pre_neg, post_neg)
+            grad_w = (grad_w_pos - grad_w_neg) / beta_denominator
+            grads.append(grad_w)
+        
+        return grads
 
-        # Same gains as used at construction
-        bias_gains = [
-            0.5 / ( (3   * 3 * 3) ** 0.5 ),
-            0.5 / ( (128 * 3 * 3) ** 0.5 ),
-            0.5 / ( (256 * 3 * 3) ** 0.5 ),
-            0.5 / ( (512 * 3 * 3) ** 0.5 ),
-            0.5 / ( (512 * 2 * 2) ** 0.5 ),
-        ]
+
+class ConvHopfieldEnergy32_Interactions(InteractionBaseHopfieldModel):
+    def __init__(self, activation=hard_sigmoid):
         weight_gains = [0.4, 0.7, 0.6, 0.3, 0.4]
-
-        # Unpack layers
-        conv1: EqPropConv2d = self.layers[0]
-        conv2: EqPropConv2d = self.layers[1]
-        conv3: EqPropConv2d = self.layers[2]
-        conv4: EqPropConv2d = self.layers[3]
-        fc:   EqPropLinear  = self.layers[4]
-
-        # 1) Biases first (b1..b5)
-        with torch.no_grad():
-            torch.nn.init.uniform_(conv1.bias, -bias_gains[0], +bias_gains[0])
-            torch.nn.init.uniform_(conv2.bias, -bias_gains[1], +bias_gains[1])
-            torch.nn.init.uniform_(conv3.bias, -bias_gains[2], +bias_gains[2])
-            torch.nn.init.uniform_(conv4.bias, -bias_gains[3], +bias_gains[3])
-            torch.nn.init.uniform_(fc.bias,    -bias_gains[4], +bias_gains[4])
-
-        # 2) Conv weights (W1..W4) with kaiming_uniform-style scale = gain*sqrt(1/size_pre)
-        with torch.no_grad():
-            for gain, layer in zip(weight_gains[:4], [conv1, conv2, conv3, conv4]):
-                kH = layer.conv.weight.shape[2]
-                kW = layer.conv.weight.shape[3]
-                size_pre = layer.conv.in_channels * kH * kW
-                scale = gain * (1.0 / size_pre) ** 0.5
-                torch.nn.init.uniform_(layer.conv.weight, -scale, +scale)
-
-        # 3) Dense weight: draw in original (512,2,2,10), then permute to (10,2048)
-        with torch.no_grad():
-            size_pre_fc = 512 * 2 * 2
-            scale_fc = weight_gains[4] * (1.0 / size_pre_fc) ** 0.5
-            tmp = torch.empty(512, 2, 2, 10, device=fc.linear.weight.device, dtype=fc.linear.weight.dtype)
-            torch.nn.init.uniform_(tmp, -scale_fc, +scale_fc)
-            w_lin = tmp.permute(3, 0, 1, 2).contiguous().view(10, 2048)
-            fc.linear.weight.copy_(w_lin)
-
-class ResNet13(BaseHopfieldModel):
-    """ResNet13 model for 32x32 input images with 4 residual blocks followed by a dense layer.
-    """
-    def __init__(self, num_inputs=3, num_outputs=10, num_hiddens_1=128, num_hiddens_2=256, 
-                 num_hiddens_3=512, num_hiddens_4=512, activation='hard-sigmoid',
-                 ):
-        super().__init__()
-        
-        # Calculate bias gains - only 2 per block (conv1, conv2), no bias for skip
         bias_gains = [
-            0.5 / np.sqrt(num_inputs * 3 * 3),      # Block 1 conv1
-            0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 1 conv2
-            0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 2 conv1
-            0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 2 conv2
-            0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 3 conv1
-            0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 3 conv2
-            0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 4 conv1
-            0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 4 conv2
-            0.5 / np.sqrt(num_hiddens_4 * 2 * 2),  # Dense layer
+            0.5 / ((3   * 3 * 3) ** 0.5),
+            0.5 / ((128 * 3 * 3) ** 0.5),
+            0.5 / ((256 * 3 * 3) ** 0.5),
+            0.5 / ((512 * 3 * 3) ** 0.5),
+            0.5 / ((512 * 2 * 2) ** 0.5),
         ]
-        weight_gains = [
-                    0.6, 0.6, 0.7,   # block-1 (skip stronger)
-                    0.6, 0.7, 0.6,   # block-2
-                    0.6, 0.7, 0.6,   # block-3
-                    0.6, 0.7, 0.6,   # block-4
-                    0.8      
+
+        interactions = [
+            InteractionConvMaxPool2d(3,   128, 3, h_out=16, w_out=16, padding=1,
+                                     weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
+            InteractionConvMaxPool2d(128, 256, 3, h_out=8,  w_out=8,  padding=1,
+                                     weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
+            InteractionConvMaxPool2d(256, 512, 3, h_out=4,  w_out=4,  padding=1,
+                                     weight_gain=weight_gains[2], bias_gain=bias_gains[2]),
+            InteractionConvMaxPool2d(512, 512, 3, h_out=2,  w_out=2,  padding=1,
+                                     weight_gain=weight_gains[3], bias_gain=bias_gains[3]),
+            InteractionLinear(512*2*2, 10,
+                              weight_gain=weight_gains[4], bias_gain=bias_gains[4]),
         ]
-        
-        self.layers = nn.ModuleList([
-            # Block 1: 3 -> 128, 32x32 -> 16x16
-            ResBlock(num_inputs, num_hiddens_1, h_out=16, w_out=16,
-                    strides=[1,2,2],
-                    h_intermediate=32, w_intermediate=32,
-                    weight_gains=weight_gains[0:3],
-                    bias_gains=bias_gains[0:2]),  # Only 2 bias gains per block
-            # Block 2: 128 -> 256, 16x16 -> 8x8
-            ResBlock(num_hiddens_1, num_hiddens_2, h_out=8, w_out=8,
-                    strides=[1,2,2],
-                    h_intermediate=16, w_intermediate=16,
-                    weight_gains=weight_gains[3:6],
-                    bias_gains=bias_gains[2:4]),  # Only 2 bias gains per block
-            # Block 3: 256 -> 512, 8x8 -> 4x4
-            ResBlock(num_hiddens_2, num_hiddens_3, h_out=4, w_out=4,
-                    strides=[1,2,2],
-                    h_intermediate=8, w_intermediate=8,
-                    weight_gains=weight_gains[6:9],
-                    bias_gains=bias_gains[4:6]),  # Only 2 bias gains per block
-            # Block 4: 512 -> 512, 4x4 -> 2x2
-            ResBlock(num_hiddens_3, num_hiddens_4, h_out=2, w_out=2,
-                    strides=[1,2,2],
-                    h_intermediate=4, w_intermediate=4,
-                    weight_gains=weight_gains[9:12],
-                    bias_gains=bias_gains[6:8]),  # Only 2 bias gains per block
-            # Dense layer: 512*2*2 -> num_outputs
-            EqPropLinear(num_hiddens_4 * 2 * 2, num_outputs,
-                        weight_gain=weight_gains[12], bias_gain=bias_gains[8], activation=identity)
-        ])
-        self.output = self.layers[-1]
+
+        state_shapes = [
+            (128, 16, 16),
+            (256, 8, 8),
+            (512, 4, 4),
+            (512, 2, 2),
+            (10,)
+        ]
+
+        activations = [activation] * 4 + [identity]
+
+        connections = [
+            (interactions[0], (0, 1)),
+            (interactions[1], (1, 2)),
+            (interactions[2], (2, 3)),
+            (interactions[3], (3, 4)),
+            (interactions[4], (4, 5))
+        ]
+
+        super().__init__(state_shapes, interactions, connections, activations)
         self.cost_type = 'CE'
 
 
-class ResNet16(BaseHopfieldModel):
-    """ResNet16 model for 32x32 input images with 5 residual blocks followed by a dense layer.
-    """
-    def __init__(self, num_inputs=3, num_outputs=10, num_hiddens_1=128, num_hiddens_2=256, 
-                 num_hiddens_3=512, num_hiddens_4=512, num_hiddens_5=1024,
-                 ):
-        super().__init__()
-        
-        # Calculate bias gains - only 2 per block (conv1, conv2), no bias for skip
-        bias_gains = [
-            0.5 / np.sqrt(num_inputs * 3 * 3),      # Block 1 conv1
-            0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 1 conv2
-            0.5 / np.sqrt(num_hiddens_1 * 3 * 3),  # Block 2 conv1
-            0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 2 conv2
-            0.5 / np.sqrt(num_hiddens_2 * 3 * 3),  # Block 3 conv1
-            0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 3 conv2
-            0.5 / np.sqrt(num_hiddens_3 * 3 * 3),  # Block 4 conv1
-            0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 4 conv2
-            0.5 / np.sqrt(num_hiddens_4 * 3 * 3),  # Block 5 conv1
-            0.5 / np.sqrt(num_hiddens_5 * 3 * 3),  # Block 5 conv2
-            0.5 / np.sqrt(num_hiddens_5 * 2 * 2),  # Dense layer
-        ]
+class ResNet13_Interactions(InteractionBaseHopfieldModel):
+    def __init__(self, num_inputs=3, num_outputs=10, activation=relu6):
+        nn.Module.__init__(self)
 
         weight_gains = [
-                    0.6, 0.6, 0.7,   # block-1 (skip stronger)
-                    0.6, 0.7, 0.6,   # block-2
-                    0.6, 0.7, 0.6,   # block-3
-                    0.6, 0.7, 0.6,   # block-4
-                    0.6, 0.7, 0.6,   # block-5
-                    0.8      
+            0.6, 0.6, 0.7,
+            0.6, 0.7, 0.6,
+            0.6, 0.7, 0.6,
+            0.6, 0.7, 0.6,
+            0.8
         ]
-        
-        self.layers = nn.ModuleList([
-            # Block 1: 3 -> 128, 32x32 -> 16x16
-            ResBlock(num_inputs, num_hiddens_1, h_out=16, w_out=16,
-                    strides=[1,2,2],
-                    h_intermediate=32, w_intermediate=32,
-                    weight_gains=weight_gains[0:3],
-                    bias_gains=bias_gains[0:2]),  # Only 2 bias gains per block
-            # Block 2: 128 -> 256, 16x16 -> 8x8
-            ResBlock(num_hiddens_1, num_hiddens_2, h_out=8, w_out=8,
-                    strides=[1,2,2],
-                    h_intermediate=16, w_intermediate=16,
-                    weight_gains=weight_gains[3:6],
-                    bias_gains=bias_gains[2:4]),  # Only 2 bias gains per block
-            # Block 3: 256 -> 512, 8x8 -> 4x4
-            ResBlock(num_hiddens_2, num_hiddens_3, h_out=4, w_out=4,
-                    strides=[1,2,2],
-                    h_intermediate=8, w_intermediate=8,
-                    weight_gains=weight_gains[6:9],
-                    bias_gains=bias_gains[4:6]),  # Only 2 bias gains per block
-            # Block 4: 512 -> 512, 4x4 -> 2x2
-            ResBlock(num_hiddens_3, num_hiddens_4, h_out=2, w_out=2,
-                    strides=[1,2,2],
-                    h_intermediate=4, w_intermediate=4,
-                    weight_gains=weight_gains[9:12],
-                    bias_gains=bias_gains[6:8]),  # Only 2 bias gains per block
-            # Block 5: 512 -> 1024, 2x2 -> 2x2
-            ResBlock(num_hiddens_4, num_hiddens_5, h_out=2, w_out=2,
-                    strides=[1,1,1],
-                    h_intermediate=2, w_intermediate=2,
-                    weight_gains=weight_gains[12:15],
-                    bias_gains=bias_gains[8:10]),  # Only 2 bias gains per block
-            # Dense layer: 1024*2*2 -> num_outputs
-            EqPropLinear(num_hiddens_5 * 2 * 2, num_outputs,
-                        weight_gain=weight_gains[15], bias_gain=bias_gains[10], activation=identity)
-        ])
-        self.output = self.layers[-1]
+        bias_gains = [0.5 / np.sqrt(ni * 3 * 3) for ni in
+                     [num_inputs, 128, 128, 256, 256, 512, 512, 512, 512]]
+
+        interactions = [
+            InteractionConv2d(3, 128, 3, h_out=32, w_out=32, stride=1, padding=1,
+                              weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
+            InteractionConv2d(128, 128, 3, h_out=16, w_out=16, stride=2, padding=1,
+                              weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
+            InteractionConv2d(3, 128, 1, h_out=16, w_out=16, stride=2, padding=0,
+                              weight_gain=weight_gains[2], bias=False),
+            
+            # Block 2
+            InteractionConv2d(128, 256, 3, h_out=16, w_out=16, stride=1, padding=1,
+                              weight_gain=weight_gains[3], bias_gain=bias_gains[2]),
+            InteractionConv2d(128, 256, 1, h_out=8, w_out=8, stride=2, padding=0,
+                              weight_gain=weight_gains[4], bias=False), # Skip (2,4)
+            InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
+                              weight_gain=weight_gains[5], bias_gain=bias_gains[3]),
+            
+            # Block 3
+            InteractionConv2d(256, 512, 3, h_out=8, w_out=8, stride=1, padding=1,
+                              weight_gain=weight_gains[6], bias_gain=bias_gains[4]),
+            InteractionConv2d(256, 512, 1, h_out=4, w_out=4, stride=2, padding=0,
+                              weight_gain=weight_gains[7], bias=False), # Skip (4,6)
+            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
+                              weight_gain=weight_gains[8], bias_gain=bias_gains[5]),
+            
+            # Block 4
+            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=1, padding=1,
+                              weight_gain=weight_gains[9], bias_gain=bias_gains[6]),
+            InteractionConv2d(512, 512, 1, h_out=2, w_out=2, stride=2, padding=0,
+                              weight_gain=weight_gains[10], bias=False), # Skip (6,8)
+            InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
+                              weight_gain=weight_gains[11], bias_gain=bias_gains[7]),
+            
+            InteractionLinear(512*2*2, num_outputs,
+                              weight_gain=weight_gains[12], bias_gain=bias_gains[8])
+        ]
+
+        state_shapes = [
+            (128, 32, 32),
+            (128, 16, 16),
+            (256, 16, 16),
+            (256, 8, 8),
+            (512, 8, 8),
+            (512, 4, 4),
+            (512, 4, 4),
+            (512, 2, 2),
+            (num_outputs,)
+        ]
+
+        activations = [activation] * 8 + [identity]
+
+        connections = [
+            (interactions[0], (0, 1)),
+            (interactions[1], (1, 2)),
+            (interactions[2], (0, 2)),
+            
+            (interactions[3], (2, 3)),
+            (interactions[4], (2, 4)), # Skip (2,4)
+            (interactions[5], (3, 4)),
+            
+            (interactions[6], (4, 5)),
+            (interactions[7], (4, 6)), # Skip (4,6)
+            (interactions[8], (5, 6)),
+            
+            (interactions[9], (6, 7)),
+            (interactions[10], (6, 8)), # Skip (6,8)
+            (interactions[11], (7, 8)),
+            
+            (interactions[12], (8, 9))
+        ]
+
+        super().__init__(state_shapes, interactions, connections, activations)
         self.cost_type = 'CE'
 
 
-def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True, n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None):
+class ResNet16_Interactions(InteractionBaseHopfieldModel):
+    def __init__(self, num_inputs=3, num_outputs=10):
+        nn.Module.__init__(self)
+        
+        weight_gains = [
+            0.6, 0.6, 0.7,
+            0.6, 0.7, 0.6,
+            0.6, 0.7, 0.6,
+            0.6, 0.7, 0.6,
+            0.6, 0.7, 0.6,
+            0.8
+        ]
+        # Only 11 bias gains: 2 per block (no skip bias) + 1 for linear
+        bias_gains = [
+            0.5 / np.sqrt(num_inputs * 3 * 3),  # Block 1 conv1
+            0.5 / np.sqrt(128 * 3 * 3),         # Block 1 conv2
+            0.5 / np.sqrt(128 * 3 * 3),         # Block 2 conv1
+            0.5 / np.sqrt(256 * 3 * 3),         # Block 2 conv2
+            0.5 / np.sqrt(256 * 3 * 3),         # Block 3 conv1
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 3 conv2
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 4 conv1
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 4 conv2
+            0.5 / np.sqrt(512 * 3 * 3),         # Block 5 conv1
+            0.5 / np.sqrt(1024 * 3 * 3),        # Block 5 conv2
+            0.5 / np.sqrt(1024 * 2 * 2),        # Linear
+        ]
+
+        interactions = [
+            # Block 1
+            InteractionConv2d(3, 128, 3, h_out=32, w_out=32, stride=1, padding=1,
+                         weight_gain=weight_gains[0], bias_gain=bias_gains[0]),
+            InteractionConv2d(128, 128, 3, h_out=16, w_out=16, stride=2, padding=1,
+                         weight_gain=weight_gains[1], bias_gain=bias_gains[1]),
+            InteractionConv2d(3, 128, 1, h_out=16, w_out=16, stride=2, padding=0,
+                         weight_gain=weight_gains[2], bias=False),  # Skip - no bias
+            # Block 2
+            InteractionConv2d(128, 256, 3, h_out=16, w_out=16, stride=1, padding=1,
+                         weight_gain=weight_gains[3], bias_gain=bias_gains[2]),
+            InteractionConv2d(256, 256, 3, h_out=8, w_out=8, stride=2, padding=1,
+                         weight_gain=weight_gains[4], bias_gain=bias_gains[3]),
+            InteractionConv2d(128, 256, 1, h_out=8, w_out=8, stride=2, padding=0,
+                         weight_gain=weight_gains[5], bias=False),  # Skip - no bias
+            # Block 3
+            InteractionConv2d(256, 512, 3, h_out=8, w_out=8, stride=1, padding=1,
+                         weight_gain=weight_gains[6], bias_gain=bias_gains[4]),
+            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=2, padding=1,
+                         weight_gain=weight_gains[7], bias_gain=bias_gains[5]),
+            InteractionConv2d(256, 512, 1, h_out=4, w_out=4, stride=2, padding=0,
+                         weight_gain=weight_gains[8], bias=False),  # Skip - no bias
+            # Block 4
+            InteractionConv2d(512, 512, 3, h_out=4, w_out=4, stride=1, padding=1,
+                         weight_gain=weight_gains[9], bias_gain=bias_gains[6]),
+            InteractionConv2d(512, 512, 3, h_out=2, w_out=2, stride=2, padding=1,
+                         weight_gain=weight_gains[10], bias_gain=bias_gains[7]),
+            InteractionConv2d(512, 512, 1, h_out=2, w_out=2, stride=2, padding=0,
+                         weight_gain=weight_gains[11], bias=False),  # Skip - no bias
+            # Block 5
+            InteractionConv2d(512, 1024, 3, h_out=2, w_out=2, stride=1, padding=1,
+                         weight_gain=weight_gains[12], bias_gain=bias_gains[8]),
+            InteractionConv2d(1024, 1024, 3, h_out=2, w_out=2, stride=1, padding=1,
+                         weight_gain=weight_gains[13], bias_gain=bias_gains[9]),
+            InteractionConv2d(512, 1024, 1, h_out=2, w_out=2, stride=1, padding=0,
+                         weight_gain=weight_gains[14], bias=False),  # Skip - no bias
+            # Final linear
+            InteractionLinear(1024*2*2, num_outputs,
+                         weight_gain=weight_gains[15], bias_gain=bias_gains[10])
+        ]
+
+        state_shapes = [
+            (128, 32, 32),  # s1
+            (128, 16, 16),  # s2
+            (256, 16, 16),  # s3
+            (256, 8, 8),    # s4
+            (512, 8, 8),    # s5
+            (512, 4, 4),    # s6
+            (512, 4, 4),    # s7
+            (512, 2, 2),    # s8
+            (1024, 2, 2),   # s9
+            (1024, 2, 2),   # s10
+            (num_outputs,)  # s11 (logits)
+        ]
+        
+        activations = [hard_sigmoid] * 10 + [identity]
+
+        connections = [
+            # Block 1
+            (interactions[0], (0, 1)),  # conv1
+            (interactions[1], (1, 2)),  # conv2
+            (interactions[2], (0, 2)),  # skip
+            # Block 2
+            (interactions[3], (2, 3)),
+            (interactions[4], (3, 4)),
+            (interactions[5], (2, 4)),
+            # Block 3
+            (interactions[6], (4, 5)),
+            (interactions[7], (5, 6)),
+            (interactions[8], (4, 6)),
+            # Block 4
+            (interactions[9], (6, 7)),
+            (interactions[10], (7, 8)),
+            (interactions[11], (6, 8)),
+            # Block 5
+            (interactions[12], (8, 9)),
+            (interactions[13], (9, 10)),
+            (interactions[14], (8, 10)),
+            # Final dense
+            (interactions[15], (10, 11))
+        ]
+
+        super().__init__(state_shapes, interactions, connections, activations)
+        self.cost_type = 'CE'
+
+
+
+def train_batch_centered(model, x, y, optimizer, beta=0.1, use_mean_reduction=True,
+                         n_iters_free=50, n_iters_nudged=50, streams=None, previous_states=None, grad_clip=None,
+                         mode='asynchronous'):
     B = x.size(0)
     device = x.device
-    
-    if previous_states is not None:
-        if previous_states[0][0].size(0) == B:
-             states = previous_states
-        else:
-             states = model.create_states(B, device)
+
+    if previous_states is not None and previous_states[0].size(0) == B:
+        states = previous_states
     else:
         states = model.create_states(B, device)
-    
-    # Free phase
-    free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_free, streams=streams)
-    free_states = [[s.detach() for s in state_list] for state_list in free_states]
-    logits_free = free_states[-1][-1]
+
+    free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_free, mode=mode, streams=streams)
+    free_states = [s.detach() for s in free_states]
+    logits_free = free_states[-1]
+
+    # Compute energy at free equilibrium with layerwise breakdown
+    with torch.no_grad():
+        E_free_tensor, layerwise_energies = model.layerwise_energies(x, free_states, beta=0.0)
+        E_free = E_free_tensor.mean().item()
 
     # Centered nudging
     b1, b2, denom = compute_betas('centered', beta)
-    
+
     # Phase 1
-    nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, streams=streams)
-    nudged_states = [[s.detach() for s in state_list] for state_list in nudged_states]
+    nudged_states = model.minimize(x, free_states, beta=b1, target=y, n_iters=n_iters_nudged, mode=mode, streams=streams)
+    nudged_states = [s.detach() for s in nudged_states]
+
     E_1 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_1 = E_1.mean() if use_mean_reduction else E_1.sum()
-    with torch.cuda.nvtx.range("Weight Grads 1"):
-        grads_1 = torch.autograd.grad(E_1, model.parameters(), create_graph=False)
-    
+    grads_1 = torch.autograd.grad(E_1, model.parameters(), create_graph=False)
+
     # Phase 2 (restart from free)
-    nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, streams=streams)
-    nudged_states = [[s.detach() for s in state_list] for state_list in nudged_states]
+    nudged_states = model.minimize(x, free_states, beta=b2, target=y, n_iters=n_iters_nudged, mode=mode, streams=streams)
+    nudged_states = [s.detach() for s in nudged_states]
     E_2 = model.energy(x, nudged_states)  # Hopfield energy only, no cost term for weight grads
     E_2 = E_2.mean() if use_mean_reduction else E_2.sum()
-    with torch.cuda.nvtx.range("Weight Grads 2"):
-        grads_2 = torch.autograd.grad(E_2, model.parameters(), create_graph=False)
+    grads_2 = torch.autograd.grad(E_2, model.parameters(), create_graph=False)
 
     # EP update
-    with torch.cuda.nvtx.range("Optimizer Step"):
-        grads = [((g2 - g1).detach() / denom) for g1, g2 in zip(grads_1, grads_2)]
-        if grad_clip is not None:
-            total_norm = torch.norm(torch.stack([g.norm() for g in grads]))
-            if total_norm > grad_clip:
-                scale = grad_clip / (total_norm + 1e-6)
-                grads = [g * scale for g in grads]
-        optimizer.zero_grad()
-        for p, g in zip(model.parameters(), grads):
-            p.grad = g
-        optimizer.step()
+    grads = [((g2 - g1).detach() / denom) for g1, g2 in zip(grads_1, grads_2)]
     
+    if grad_clip is not None:
+        total_norm = torch.norm(torch.stack([g.norm() for g in grads]))
+        if total_norm > grad_clip:
+            scale = grad_clip / (total_norm + 1e-6)
+            grads = [g * scale for g in grads]
+            
+    optimizer.zero_grad()
+    for p, g in zip(model.parameters(), grads):
+        p.grad = g
+    optimizer.step()
+
     # Task loss from free-phase logits
     if model.cost_type == 'CE':
         batch_loss = F.cross_entropy(logits_free, y).item()
     else:
         one_hot = F.one_hot(y, num_classes=logits_free.shape[1]).float()
         batch_loss = (0.5 * ((logits_free - one_hot) ** 2).sum(dim=1)).mean().item()
-    return float(E_1.item()), float(E_2.item()), logits_free, batch_loss, nudged_states  # Match original: uses 2nd nudged phase states
+
+    return E_free, float(E_1.item()), logits_free, batch_loss, nudged_states, free_states, layerwise_energies
 
 
 def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=None):
@@ -403,9 +696,9 @@ def evaluate(model, dataloader, device: str, n_iters_infer: int = 120, streams=N
         x = x.to(device)
         y = y.to(device)
         B = x.size(0)
-        states = model.create_states(B, device)
-        free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_infer, streams=streams)
-        logits = free_states[-1][-1]
+        states = model.create_states(B, x.device)
+        free_states = model.minimize(x, states, beta=0.0, n_iters=n_iters_infer, mode='asynchronous', streams=streams)
+        logits = free_states[-1]
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += B
